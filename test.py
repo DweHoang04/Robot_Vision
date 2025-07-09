@@ -196,24 +196,33 @@ class BinPickingSystem:
     
     # Calculating angles between the principal axis of the block and the principal axis of the camera
     def calculate_y_axis_angle_xy(self, minor_axis):
-        # 단위 벡터로 정규화
-        v2d = minor_axis[:2] / np.linalg.norm(minor_axis[:2])
+        # 단위 벡터로 정규화 (Normalize into a unit vector)
+        v2d = minor_axis[:2] / np.linalg.norm(minor_axis[:2]) 
 
         def clockwise_angle_from_y(vec):
             # Y축 기준 시계방향 회전각도 (0~360)
+            # Clockwise angle relative to the Y-axis (range: 0–360 degrees)
             angle = np.degrees(np.arctan2(vec[0], vec[1])) % 360
             return angle
 
+        # PCA treats vectors as line, not vectors, therefore, with different numerical angle values,
+        # we can get the same line. Therefore, by calculating angle1 and angle2, we ensure that the
+        # value to be used is the smallest clockwise angle from Y-axis
         angle1 = clockwise_angle_from_y(v2d)
         angle2 = clockwise_angle_from_y(-v2d)
-
         # 선(line)이므로 방향성 제거 → 둘 중 더 작은 회전각이 실제 선의 시계방향 회전각
-        angle_deg = min(angle1, angle2)
+        angle_deg_y = min(angle1, angle2)
+        
         # 90° 초과 시 보완각으로 변환
-        if angle_deg > 90:
-            angle_deg = 180 - angle_deg
-            angle_deg = - angle_deg
-        return angle_deg  # 최종적으로 음수 부호 붙여 반환
+        # If the angle exceeds 90°, convert it to a complementary negative angle
+        if angle_deg_y > 90:
+            angle_deg_y = 180 - angle_deg_y
+            angle_deg_y = - angle_deg_y
+        return angle_deg_y  # 최종적으로 음수 부호 붙여 반환 # Final return is a signed angle (can be negative)
+    
+    # def calculate_x_axis_angle_xy(self, major_axis):
+        
+    #     return angle_deg_x
 
     # Extracting the most dominant color from a set of RGB values
     def get_dominant_color(self, colors):
@@ -255,9 +264,9 @@ class BinPickingSystem:
             # Dimension reduction algorithm
             pca = PCA(n_components=3).fit(lego_pts) # 3 PCA Components
             center = np.mean(lego_pts, axis=0)
-            angle_deg = self.calculate_y_axis_angle_xy(pca.components_[1])
+            angle_deg_y = self.calculate_y_axis_angle_xy(pca.components_[1])
             dom_color = self.get_dominant_color(lego_cols)
-            results.append((center, dom_color, angle_deg))
+            results.append((center, dom_color, angle_deg_y))
 
         # 🧩 시각화
         if geometries:
