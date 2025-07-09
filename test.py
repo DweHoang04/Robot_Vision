@@ -20,7 +20,7 @@ from pykinect2.PyKinectV2 import *
 # Main Program
 class BinPickingSystem:
 
-    # Initializing
+    # Initializing (This part is for the robot arm so it is not necessary)
     def __init__(self, wdf_path):
         self.output_dir = "C:\\Users\\FILAB\\Desktop\\DUY\\Results" # Data saving location
         self.host = "192.168.1.23" # Target IP for sending data
@@ -53,35 +53,44 @@ class BinPickingSystem:
         mask = (a * points[:, 0] + b * points[:, 1] + c * points[:, 2] + d <= 0)
         return points[mask], colors[mask]
 
-
-
+    # Transforming points to normalize them to world coordinate
     def transform_point_cloud(self, points):
-        new_origin = np.array([-0.1663194511548611, -0.30196779718241507, 0.652])
+        new_origin = np.array([-0.1663194511548611, -0.30196779718241507, 0.652]) # Why this coordinate?
+        # Rotating matrix that swap X and Y coordinates and invert Z coordinate
         rotation_matrix = np.array([
             [0,  1,  0],
             [1,  0,  0],
             [0,  0, -1]
-        ])
-        translated = points - new_origin
-        transformed = np.dot(translated, rotation_matrix.T)
+        ]) 
+        translated = points - new_origin # Shifting the points to normalize the new coordinate
+        transformed = np.dot(translated, rotation_matrix.T) # Transforming the points using dot product
         return transformed
 
+    # Main depth and RGB data acquiring and processing
     def capture_and_preprocess_kinect_data(self, roi_x=195, roi_y=50, roi_w=245, roi_h=300,
                                            plane_dist_thresh=0.005, ransac_n=3, ransac_iter=1000,
-                                           boundary_margin=0.005, dbscan_eps_pre=0.01, dbscan_min_samples_pre=50):
+                                           boundary_margin=0.005, dbscan_eps_pre=0.01, dbscan_min_samples_pre=50): # These settings are for DBSCAN filtering
+        # ROI: Region of Interest
         kinect = PyKinectRuntime.PyKinectRuntime(PyKinectV2.FrameSourceTypes_Depth | PyKinectV2.FrameSourceTypes_Color)
+        # RANSAC Algorithm: An algorithm used for estimating parameters of a mathematical model from a set of observed data that contains outliers
+        # when outliers are to be no influence on the estimated values. On the other hand, it can be used to detect outliers.
         print("여기옴?")
+        # Starting Kinect and wait until both depth frames and color frames are ready
         while not (kinect.has_new_depth_frame() and kinect.has_new_color_frame()):
             
-            time.sleep(0.01)
+            time.sleep(0.01) # Time delay
 
+        # Getting the latest data of depth frames and color frames
         depth_frame = kinect.get_last_depth_frame().reshape((kinect.depth_frame_desc.Height, kinect.depth_frame_desc.Width))
         color_frame = kinect.get_last_color_frame().reshape((kinect.color_frame_desc.Height, kinect.color_frame_desc.Width, 4))[:, :, :3]
-        color_frame = cv2.cvtColor(color_frame, cv2.COLOR_BGR2RGB)
+        color_frame = cv2.cvtColor(color_frame, cv2.COLOR_BGR2RGB) # Converting BGR data from color frame to RGB data
 
+        # Cropping the region of interest
         depth_roi = depth_frame[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w]
         color_roi = color_frame[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w]
 
+        # Intrinsics (Internal characteristics) of a camera includes focal length, pixel dimensions, resolution
+        # This part of the code is used for camera's intrinsics parameters retrieval to convert depth data into 3D points
         intrinsics = kinect._mapper.GetDepthCameraIntrinsics()
         fx, fy = intrinsics.FocalLengthX, intrinsics.FocalLengthY
         cx, cy = intrinsics.PrincipalPointX, intrinsics.PrincipalPointY
@@ -89,40 +98,53 @@ class BinPickingSystem:
         points, colors = [], []
         for i in range(depth_roi.shape[0]):
             for j in range(depth_roi.shape[1]):
-                z = depth_roi[i, j] * 0.001
+                z = depth_roi[i, j] * 0.001 # mm to meter
                 if z > 0:
+                    # Calculating x and y coordinates using pinhole camera equations
                     x = (j + roi_x - cx) * z / fx
-                    y = -(i + roi_y - cy) * z / fy
+                    y = -(i + roi_y - cy) * z / fy # Flip y direction
+                    
+                    # Mapping 3D depth points to its corresponding pixel in the color image
                     depth_point = PyKinectV2._DepthSpacePoint()
-                    depth_point.x, depth_point.y = j + roi_x, i + roi_y
+                    depth_point.x, depth_point.y = j + roi_x, i + roi_y # Scanning the region of interest
                     color_point = kinect._mapper.MapDepthPointToColorSpace(depth_point, depth_roi[i, j])
+                    # Getting RGB color for each point
                     cx_c, cy_c = int(color_point.x), int(color_point.y)
                     if 0 <= cx_c < color_frame.shape[1] and 0 <= cy_c < color_frame.shape[0]:
-                        c = color_frame[cy_c, cx_c] / 255.0
+                        c = color_frame[cy_c, cx_c] / 255.0 # Normalizing them by dividing by 255
+                        # Appending to corresponding point
                         points.append((x, y, z))
                         colors.append(c)
 
         kinect.close()
+        # Converting the data to numpy arrays
         points = np.array(points)
         colors = np.array(colors)
 
+        # Early exit if the array is empty (no data or not sufficient data acquired)
         if len(points) < 3:
             return np.array([]), np.array([])
 
+        # Preparing the point cloud for plane segmentation and processing
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points)
         pcd.colors = o3d.utility.Vector3dVector(colors)
 
+        # Finding best-fit plane using RANSAC
         plane_model, inliers = pcd.segment_plane(distance_threshold=plane_dist_thresh,
                                                  ransac_n=ransac_n,
                                                  num_iterations=ransac_iter)
+        # Removing the bin floor, keep only the object in the xy-plane
         non_plane_cloud = pcd.select_by_index(inliers, invert=True)
+        # Applying the filters to keep only the object that is above the floor (plane)
         above_points, above_colors = self.keep_points_above_plane(np.asarray(non_plane_cloud.points),
                                                                   np.asarray(non_plane_cloud.colors),
                                                                   plane_model)
+        # If there is no point above the plane then return null arrays
         if len(above_points) == 0:
             return np.array([]), np.array([])
 
+        # Removing margin points
         x_min, y_min, _ = np.min(above_points, axis=0)
         x_max, y_max, _ = np.max(above_points, axis=0)
         margin_points, margin_colors = self.keep_inside_boundary_points(above_points, above_colors,
@@ -137,9 +159,11 @@ class BinPickingSystem:
         if len(denoised_points) == 0:
             return np.array([]), np.array([])
 
+        # Apply DBSCAN to the noise
         transformed = self.transform_point_cloud(denoised_points)
         return transformed, denoised_colors
 
+    # Saving processed data
     def save_transformed_point_cloud(self, points, colors, output_file):
         data = np.hstack([points, colors])
         np.savetxt(output_file, data, delimiter=' ', fmt='%f')
@@ -169,6 +193,8 @@ class BinPickingSystem:
             angle_deg = -angle_deg
         return angle_deg
     '''
+    
+    # Calculating angles between the principal axis of the block and the principal axis of the camera
     def calculate_y_axis_angle_xy(self, minor_axis):
         # 단위 벡터로 정규화
         v2d = minor_axis[:2] / np.linalg.norm(minor_axis[:2])
@@ -189,12 +215,14 @@ class BinPickingSystem:
             angle_deg = - angle_deg
         return angle_deg  # 최종적으로 음수 부호 붙여 반환
 
+    # Extracting the most dominant color from a set of RGB values
     def get_dominant_color(self, colors):
         c_int = (colors * 255).astype(int)
         counter = Counter(map(tuple, c_int))
         dom = max(counter, key=counter.get)
-        return np.array(dom) / 255.0
-
+        return np.array(dom) / 255.0 # Normalizing it to float type
+    
+    #  Clusters 3D object data and saves a summary file with position, color, and orientation
     def cluster_and_save_summary(self, transformed_file, summary_file,
                                  dbscan_eps=0.01, dbscan_min_samples=10):
         data = np.loadtxt(transformed_file, delimiter=' ')
@@ -224,7 +252,8 @@ class BinPickingSystem:
             geometries.append(pcd)
 
             # ✅ PCA 및 중심/방향 계산
-            pca = PCA(n_components=3).fit(lego_pts)
+            # Dimension reduction algorithm
+            pca = PCA(n_components=3).fit(lego_pts) # 3 PCA Components
             center = np.mean(lego_pts, axis=0)
             angle_deg = self.calculate_y_axis_angle_xy(pca.components_[1])
             dom_color = self.get_dominant_color(lego_cols)
@@ -252,9 +281,11 @@ class BinPickingSystem:
     #         s.sendall(filename)
     #         s.sendall(file_data)
 
+    # Running the pipeline and saving data
     def run_pipeline(self):
         print("0")
         points, colors = self.capture_and_preprocess_kinect_data()
+        # Check if the pipeline is running or not
         if len(points) == 0:
             print("[PIPELINE] 유효 포인트가 없어 종료.")
             return
