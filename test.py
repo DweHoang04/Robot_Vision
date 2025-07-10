@@ -23,8 +23,8 @@ class BinPickingSystem:
     # Initializing (This part is for the robot arm so it is not necessary)
     def __init__(self, wdf_path):
         self.output_dir = "C:\\Users\\FILAB\\Desktop\\DUY\\Results" # Data saving location
-        self.host = "192.168.1.23" # Target IP for sending data
-        self.port = 9999 # Target port
+        self.host = "192.168.1.23" # Target IP for sending data to the robot arm
+        self.port = 9999 # Target (Robot arm) port
 
     # Border filtering algorithm using AND logic
     def keep_inside_boundary_points(self, points, colors, x_min, x_max, y_min, y_max, margin=0.02):
@@ -219,10 +219,6 @@ class BinPickingSystem:
             angle_deg_y = 180 - angle_deg_y
             angle_deg_y = - angle_deg_y
         return angle_deg_y  # 최종적으로 음수 부호 붙여 반환 # Final return is a signed angle (can be negative)
-    
-    # def calculate_x_axis_angle_xy(self, major_axis):
-        
-    #     return angle_deg_x
 
     # Extracting the most dominant color from a set of RGB values
     def get_dominant_color(self, colors):
@@ -263,6 +259,7 @@ class BinPickingSystem:
             # ✅ PCA 및 중심/방향 계산
             # Dimension reduction algorithm
             pca = PCA(n_components=3).fit(lego_pts) # 3 PCA Components
+            # Calculating the center point by taking the mean values of x, y and z by column (meaning of axis=0)
             center = np.mean(lego_pts, axis=0)
             angle_deg_y = self.calculate_y_axis_angle_xy(pca.components_[1])
             dom_color = self.get_dominant_color(lego_cols)
