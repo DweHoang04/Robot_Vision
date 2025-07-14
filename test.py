@@ -65,6 +65,29 @@ class BinPickingSystem:
         translated = points - new_origin # Shifting the points to normalize the new coordinate
         transformed = np.dot(translated, rotation_matrix.T) # Transforming the points using dot product
         return transformed
+    
+    def boost_saturation_rgb_colors(colors, boost_factor=1.5):
+        """
+        Boost saturation of RGB color data (Nx3 float32 array in 0~1 range) for better HSV-based separation.
+        Returns: Saturation-boosted RGB colors (still in 0~1 range)
+        """
+        # Convert RGB float [0~1] to uint8 [0~255] for OpenCV
+        rgb_uint8 = (colors * 255).astype(np.uint8).reshape(-1, 1, 3)
+
+        # Convert to HSV
+        hsv = cv2.cvtColor(rgb_uint8, cv2.COLOR_RGB2HSV)
+        h, s, v = cv2.split(hsv)
+
+        # Boost saturation
+        s = np.clip(s.astype(np.float32) * boost_factor, 0, 255).astype(np.uint8)
+
+        # Merge and convert back to RGB
+        boosted_hsv = cv2.merge([h, s, v])
+        boosted_rgb = cv2.cvtColor(boosted_hsv, cv2.COLOR_HSV2RGB).reshape(-1, 3)
+
+        # Convert back to float in 0~1 range
+        boosted_rgb_normalized = boosted_rgb.astype(np.float32) / 255.0
+        return boosted_rgb_normalized
 
     # Main depth and RGB data acquiring and processing
     def capture_and_preprocess_kinect_data(self, roi_x=195, roi_y=50, roi_w=245, roi_h=300,
@@ -156,6 +179,11 @@ class BinPickingSystem:
         denoised_points, denoised_colors = self.apply_dbscan(margin_points, margin_colors,
                                                              eps=dbscan_eps_pre,
                                                              min_samples=dbscan_min_samples_pre)
+        
+        # Boost color saturation to better distinguish similar hues
+        denoised_colors = boost_saturation_rgb_colors(denoised_colors, boost_factor=1.5)
+
+        
         if len(denoised_points) == 0:
             return np.array([]), np.array([])
 
@@ -227,11 +255,39 @@ class BinPickingSystem:
         dom = max(counter, key=counter.get)
         return np.array(dom) / 255.0 # Normalizing it to float type
     
+    @staticmethod
+    def classify_color_from_rgb(rgb_color):
+        """
+        Classify a normalized RGB color into a brick label using HSV color rules.
+        """
+        # Convert to OpenCV HSV space
+        bgr = (np.array(rgb_color[::-1]) * 255).astype(np.uint8).reshape(1, 1, 3)
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[0, 0]
+        h, s, v = hsv
+
+        # Brick-specific color ranges from your samples
+        if 90 <= h <= 130:
+            if v < 100:
+                return "dark_blue"
+            else:
+                return "light_blue"
+        elif 5 <= h <= 15 and s > 100:
+            return "red"
+        elif 10 <= h <= 30 and s > 100:
+            return "orange"
+        else:
+            return "unknown"
+    
     #  Clusters 3D object data and saves a summary file with position, color, and orientation
     def cluster_and_save_summary(self, transformed_file, summary_file,
-                                 dbscan_eps=0.01, dbscan_min_samples=10):
+                             dbscan_eps=0.01, dbscan_min_samples=10,
+                             z_threshold=0.01):
         data = np.loadtxt(transformed_file, delimiter=' ')
         points, colors = data[:, :3], data[:, 3:6]
+
+        # 🔝 Step 1: Find top surface Z from the full point cloud
+        global_max_z = np.max(points[:, 2])
+
         dbscan = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples).fit(points)
         labels = dbscan.labels_
 
@@ -241,41 +297,90 @@ class BinPickingSystem:
         for lbl in set(labels):
             if lbl == -1:
                 continue
+
             m = (labels == lbl)
             lego_pts = points[m]
             lego_cols = colors[m]
-            print(f"전 : {len(lego_pts)}")
-            # 🔍 클러스터 크기 필터링
+
             if len(lego_pts) < 500:
                 continue
-            print(f"후 : {len(lego_pts)}")
 
-            # ⬇️ 시각화용 geometry 생성
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(lego_pts)
-            pcd.colors = o3d.utility.Vector3dVector(lego_cols)
-            geometries.append(pcd)
+            # 🔄 Reset color groups per spatial cluster
+            color_groups = {}
 
-            # ✅ PCA 및 중심/방향 계산
-            # Dimension reduction algorithm
-            pca = PCA(n_components=3).fit(lego_pts) # 3 PCA Components
-            # Calculating the center point by taking the mean values of x, y and z by column (meaning of axis=0)
-            center = np.mean(lego_pts, axis=0)
-            angle_deg_y = self.calculate_y_axis_angle_xy(pca.components_[1])
-            dom_color = self.get_dominant_color(lego_cols)
-            results.append((center, dom_color, angle_deg_y))
+            for i in range(len(lego_pts)):
+                label = self.classify_color_from_rgb(lego_cols[i])
+                if label not in color_groups:
+                    color_groups[label] = {'pts': [], 'cols': []}
+                color_groups[label]['pts'].append(lego_pts[i])
+                color_groups[label]['cols'].append(lego_cols[i])
 
-        # 🧩 시각화
+            for label, data in color_groups.items():
+                pts = np.array(data['pts'])
+                cols = np.array(data['cols'])
+
+                if len(pts) < 500:
+                    continue
+
+                sub_dbscan = DBSCAN(eps=0.01, min_samples=20).fit(pts)
+                sub_labels = sub_dbscan.labels_
+
+                for sub_lbl in set(sub_labels):
+                    if sub_lbl == -1:
+                        continue
+
+                    m = (sub_labels == sub_lbl)
+                    sub_pts = pts[m]
+                    sub_cols = cols[m]
+
+                    if len(sub_pts) < 500:
+                        continue
+
+                    # 🔍 Step 2: Depth-based filtering (top layer check)
+                    z90 = np.percentile(sub_pts[:, 2], 90)  # 90th percentile for robustness
+                    if z90 < global_max_z - z_threshold:
+                        continue  # Skip this brick; it's below the top layer
+
+                    # ✅ PCA and feature extraction
+                    pca = PCA(n_components=3).fit(sub_pts)
+                    major_axis = pca.components_[0]
+                    minor_axis = pca.components_[1]
+                    normal_axis = pca.components_[2]
+
+                    center = np.mean(sub_pts, axis=0)
+                    angle_deg_y = self.calculate_y_axis_angle_xy(minor_axis)
+                    dom_color = self.get_dominant_color(sub_cols)
+
+                    results.append((center, dom_color, angle_deg_y, label))
+
+                    # Visuals
+                    def create_axis_line(origin, direction, color):
+                        scale = 0.05
+                        line = o3d.geometry.LineSet()
+                        line.points = o3d.utility.Vector3dVector([origin, origin + direction * scale])
+                        line.lines = o3d.utility.Vector2iVector([[0, 1]])
+                        line.colors = o3d.utility.Vector3dVector([color])
+                        return line
+
+                    pcd = o3d.geometry.PointCloud()
+                    pcd.points = o3d.utility.Vector3dVector(sub_pts)
+                    pcd.colors = o3d.utility.Vector3dVector(sub_cols)
+                    geometries.append(pcd)
+                    geometries.append(create_axis_line(center, major_axis, [1, 0, 0]))
+                    geometries.append(create_axis_line(center, minor_axis, [0, 1, 0]))
+                    geometries.append(create_axis_line(center, normal_axis, [0, 0, 1]))
+
+        # Visualization
         if geometries:
             axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1, origin=[0, 0, 0])
             o3d.visualization.draw_geometries([axes] + geometries, window_name="Filtered Clusters")
 
-        # 💾 파일 저장
+        # Save results to file
         with open(summary_file, "w") as f:
-            for center, color, angle in results:
+            for center, color, angle, label in results:
                 cx, cy, cz = center * 1000.0
                 r_, g_, b_ = color
-                f.write(f"{cx:.2f} {cy:.2f} {cz:.2f} {r_:.6f} {g_:.6f} {b_:.6f} {angle:.2f}\n")
+                f.write(f"{cx:.2f} {cy:.2f} {cz:.2f} {r_:.6f} {g_:.6f} {b_:.6f} {angle:.2f} {label}\n")
 
     # def send_file_via_tcp(self, file_path):
     #     filename = os.path.basename(file_path).encode('utf-8')
@@ -310,8 +415,59 @@ class BinPickingSystem:
         # # 🔻 서버 전송 기능은 주석 처리
         # self.send_file_via_tcp(summary_file)
         # print("[PIPELINE] 모든 공정이 완료되었습니다.")
+    
+    # Collecting RGB data from bricks
+    def collect_rgb_statistics(self, sample_count=200):
+        print(f"[COLOR SAMPLING] Starting collection of {sample_count} samples...")
+        all_colors = []
+
+        for i in range(sample_count):
+            print(f"[{i+1}/{sample_count}] Capturing frame...")
+            points, colors = self.capture_and_preprocess_kinect_data()
+
+            if len(points) == 0:
+                print(" - No valid points, skipping...")
+                continue
+
+            all_colors.append(colors)
+
+        if len(all_colors) == 0:
+            print("[COLOR SAMPLING] No color data collected.")
+            return
+
+        # Concatenate all color arrays
+        all_colors_np = np.concatenate(all_colors, axis=0)
+
+        # Mean
+        mean_rgb = np.mean(all_colors_np, axis=0)
+
+        # Standard deviation
+        std_rgb = np.std(all_colors_np, axis=0)
+
+        # Min and Max
+        min_rgb = np.min(all_colors_np, axis=0)
+        max_rgb = np.max(all_colors_np, axis=0)
+
+        # Print results
+        print("\n[COLOR STATISTICS]")
+        print(f"Mean RGB: R={mean_rgb[0]:.3f}, G={mean_rgb[1]:.3f}, B={mean_rgb[2]:.3f}")
+        print(f"Std  RGB: R={std_rgb[0]:.3f}, G={std_rgb[1]:.3f}, B={std_rgb[2]:.3f}")
+        print(f"Min  RGB: R={min_rgb[0]:.3f}, G={min_rgb[1]:.3f}, B={min_rgb[2]:.3f}")
+        print(f"Max  RGB: R={max_rgb[0]:.3f}, G={max_rgb[1]:.3f}, B={max_rgb[2]:.3f}")
+
+        # Save results to file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_path = os.path.join(self.output_dir, f"rgb_statistics_{timestamp}.txt")
+        with open(save_path, "w") as f:
+            f.write("[COLOR STATISTICS]\n")
+            f.write(f"Mean RGB: {mean_rgb[0]:.6f} {mean_rgb[1]:.6f} {mean_rgb[2]:.6f}\n")
+            f.write(f"Std  RGB: {std_rgb[0]:.6f} {std_rgb[1]:.6f} {std_rgb[2]:.6f}\n")
+            f.write(f"Min  RGB: {min_rgb[0]:.6f} {min_rgb[1]:.6f} {min_rgb[2]:.6f}\n")
+            f.write(f"Max  RGB: {max_rgb[0]:.6f} {max_rgb[1]:.6f} {max_rgb[2]:.6f}\n")
+        print(f"[COLOR SAMPLING] Saved to {save_path}")
         
 if __name__ == "__main__":
     # 예: WADF 경로가 필요 없는 경우 빈 문자열로 초기화하거나 필요 시 경로 지정
     system = BinPickingSystem(wdf_path="")
     system.run_pipeline()
+    # system.collect_rgb_statistics(sample_count=200)
