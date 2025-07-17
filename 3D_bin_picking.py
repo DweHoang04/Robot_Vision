@@ -17,14 +17,14 @@ from sklearn.decomposition import PCA # Dimensionality reduction (flatten into l
 from pykinect2 import PyKinectRuntime, PyKinectV2
 from pykinect2.PyKinectV2 import *
 
-# Main Program
+# Functions
 class BinPickingSystem:
 
     # Initializing (This part is for the robot arm so it is not necessary)
     def __init__(self, wdf_path):
         self.output_dir = "C:\\Users\\FILAB\\Desktop\\DUY\\Results" # Data saving location
-        self.host = "192.168.1.23" # Target IP for sending data to the robot arm
-        self.port = 9999 # Target (Robot arm) port
+        # self.host = "192.168.1.23" # Target IP for sending data to the robot arm
+        # self.port = 9999 # Target (Robot arm) port
 
     # Border filtering algorithm using AND logic
     def keep_inside_boundary_points(self, points, colors, x_min, x_max, y_min, y_max, margin=0.02):
@@ -34,6 +34,13 @@ class BinPickingSystem:
         ) # Removing the border by an amount of margin
         # The scanning range will be (x_min + margin, x_max - margin) x (y_min + margin, y_max - margin)
         return points[mask], colors[mask] # Return filtered point cloud and color values
+    
+    # Filter 3D points so that only those above or on a reference plane are kept
+    def keep_points_above_plane(self, points, colors, plane_model):
+        a, b, c, d = plane_model
+        # Calculating distance from the point to the plane (< 0: Below; = 0: On; > 0: Above)
+        mask = (a * points[:, 0] + b * points[:, 1] + c * points[:, 2] + d <= 0)
+        return points[mask], colors[mask]
 
     # Noise filtering in depth scanning using Density-based spatial clustering
     def apply_dbscan(self, points, colors, eps=0.05, min_samples=10):
@@ -43,14 +50,6 @@ class BinPickingSystem:
         dbscan = DBSCAN(eps=eps, min_samples=min_samples).fit(points)
         labels = dbscan.labels_ # Points in dense regions get acluster label 
         mask = (labels != -1) # Noise points get a lable -1
-        return points[mask], colors[mask]
-
-
-    # Filter 3D points so that only those above or on a reference plane are kept
-    def keep_points_above_plane(self, points, colors, plane_model):
-        a, b, c, d = plane_model
-        # Calculating distance from the point to the plane (< 0: Below; = 0: On; > 0: Above)
-        mask = (a * points[:, 0] + b * points[:, 1] + c * points[:, 2] + d <= 0)
         return points[mask], colors[mask]
 
     # Transforming points to normalize them to world coordinate
@@ -70,14 +69,16 @@ class BinPickingSystem:
     def capture_and_preprocess_kinect_data(self, roi_x=195, roi_y=50, roi_w=245, roi_h=300,
                                            plane_dist_thresh=0.005, ransac_n=3, ransac_iter=1000,
                                            boundary_margin=0.005, dbscan_eps_pre=0.01, dbscan_min_samples_pre=50): # These settings are for DBSCAN filtering
+        
+        "This part of the function is used for frame capturing"
         # ROI: Region of Interest
         kinect = PyKinectRuntime.PyKinectRuntime(PyKinectV2.FrameSourceTypes_Depth | PyKinectV2.FrameSourceTypes_Color)
         # RANSAC Algorithm: An algorithm used for estimating parameters of a mathematical model from a set of observed data that contains outliers
         # when outliers are to be no influence on the estimated values. On the other hand, it can be used to detect outliers.
         print("여기옴?")
+        
         # Starting Kinect and wait until both depth frames and color frames are ready
         while not (kinect.has_new_depth_frame() and kinect.has_new_color_frame()):
-            
             time.sleep(0.01) # Time delay
 
         # Getting the latest data of depth frames and color frames
@@ -171,6 +172,8 @@ class BinPickingSystem:
 
             # Boost saturation
             s = np.clip(s.astype(np.float32) * boost_factor, 0, 255).astype(np.uint8)
+            
+            v = cv2.equalizeHist(v) # Optional: Equalize brightness for better contrast
 
             # Merge and convert back to RGB
             boosted_hsv = cv2.merge([h, s, v])
@@ -181,17 +184,21 @@ class BinPickingSystem:
             return boosted_rgb_normalized
         
         # Boost color saturation to better distinguish similar hues
-        denoised_colors = boost_saturation_rgb_colors(denoised_colors, boost_factor=1.5)
-
+        # denoised_colors = boost_saturation_rgb_colors(denoised_colors, boost_factor=1.5)
         
+        # If there is no point after denoising then return null arrays
         if len(denoised_points) == 0:
             return np.array([]), np.array([])
 
-        # Apply DBSCAN to the noise
+        # Transform the point cloud to the world coordinate system
+        # This is done to normalize the point cloud to a fixed coordinate system
+        # so that the robot arm can easily pick up the object
         transformed = self.transform_point_cloud(denoised_points)
         return transformed, denoised_colors
 
-    # Saving processed data
+    # Saving processed data into a text file
+    # The file will contain 3D points and their corresponding RGB colors
+    # The format is: x y z r g b
     def save_transformed_point_cloud(self, points, colors, output_file):
         data = np.hstack([points, colors])
         np.savetxt(output_file, data, delimiter=' ', fmt='%f')
@@ -211,6 +218,7 @@ class BinPickingSystem:
         time.sleep(0.1)  # 렌더링 안정화
         vis.capture_screen_image(image_path)
         vis.destroy_window()
+    
     '''    
     # 마이너스면 왼쪽으로 돌고 플러스면 오른쪽으로 돈다.
     def calculate_y_axis_angle_xy(self, minor_axis):
@@ -258,23 +266,30 @@ class BinPickingSystem:
     @staticmethod
     def classify_color_from_rgb(rgb_color):
         """
-        Classify a normalized RGB color into a brick label using HSV color rules.
+        Classify a raw RGB color (0–255 range) into a brick label using RGB rules.
         """
-        # Convert to OpenCV HSV space
-        bgr = (np.array(rgb_color[::-1]) * 255).astype(np.uint8).reshape(1, 1, 3)
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[0, 0]
-        h, s, v = hsv
+        r, g, b = rgb_color
 
-        # Brick-specific color ranges from your samples
-        if 90 <= h <= 130:
-            if v < 100:
-                return "dark_blue"
-            else:
-                return "light_blue"
-        elif 5 <= h <= 15 and s > 100:
+        # Dark Blue: R low, G low, B high
+        if r < 80 and g < 80 and b > 100:
+            return "dark_blue"
+
+        # Light Blue: R ~ low-mid, G high, B high
+        elif r < 100 and g > 150 and b > 150:
+            return "light_blue"
+
+        # Red: R high, G low, B low
+        elif r > 150 and g < 100 and b < 100:
             return "red"
-        elif 10 <= h <= 30 and s > 100:
+
+        # Orange: R very high, G mid-high, B low
+        elif r > 180 and 100 < g < 180 and b < 100:
             return "orange"
+
+        # Green: G high, R & B low-mid
+        elif g > 130 and r < 130 and b < 130:
+            return "green"
+
         else:
             return "unknown"
     
@@ -284,9 +299,6 @@ class BinPickingSystem:
                              z_threshold=0.01):
         data = np.loadtxt(transformed_file, delimiter=' ')
         points, colors = data[:, :3], data[:, 3:6]
-
-        # 🔝 Step 1: Find top surface Z from the full point cloud
-        global_max_z = np.max(points[:, 2])
 
         dbscan = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples).fit(points)
         labels = dbscan.labels_
@@ -305,82 +317,58 @@ class BinPickingSystem:
             if len(lego_pts) < 500:
                 continue
 
-            # 🔄 Reset color groups per spatial cluster
-            color_groups = {}
+            # 🌈 Classify once per cluster using dominant RGB
+            dom_color = self.get_dominant_color(lego_cols)
+            label = self.classify_color_from_rgb((dom_color * 255).astype(np.uint8))
 
-            for i in range(len(lego_pts)):
-                label = self.classify_color_from_rgb(lego_cols[i])
-                if label not in color_groups:
-                    color_groups[label] = {'pts': [], 'cols': []}
-                color_groups[label]['pts'].append(lego_pts[i])
-                color_groups[label]['cols'].append(lego_cols[i])
+            sub_dbscan = DBSCAN(eps=0.01, min_samples=20).fit(lego_pts)
+            sub_labels = sub_dbscan.labels_
 
-            for label, data in color_groups.items():
-                pts = np.array(data['pts'])
-                cols = np.array(data['cols'])
-
-                if len(pts) < 500:
+            for sub_lbl in set(sub_labels):
+                if sub_lbl == -1:
                     continue
 
-                sub_dbscan = DBSCAN(eps=0.01, min_samples=20).fit(pts)
-                sub_labels = sub_dbscan.labels_
+                m = (sub_labels == sub_lbl)
+                sub_pts = lego_pts[m]
+                sub_cols = lego_cols[m]
 
-                for sub_lbl in set(sub_labels):
-                    if sub_lbl == -1:
-                        continue
+                if len(sub_pts) < 500:
+                    continue
 
-                    m = (sub_labels == sub_lbl)
-                    sub_pts = pts[m]
-                    sub_cols = cols[m]
+                pca = PCA(n_components=3).fit(sub_pts)
+                major_axis, minor_axis, normal_axis = pca.components_
 
-                    if len(sub_pts) < 500:
-                        continue
+                center = np.mean(sub_pts, axis=0)
+                angle_deg_y = self.calculate_y_axis_angle_xy(minor_axis)
 
-                    # 🔍 Step 2: Depth-based filtering (top layer check)
-                    z90 = np.percentile(sub_pts[:, 2], 90)  # 90th percentile for robustness
-                    if z90 < global_max_z - z_threshold:
-                        continue  # Skip this brick; it's below the top layer
+                results.append((center, dom_color, angle_deg_y, label))
 
-                    # ✅ PCA and feature extraction
-                    pca = PCA(n_components=3).fit(sub_pts)
-                    major_axis = pca.components_[0]
-                    minor_axis = pca.components_[1]
-                    normal_axis = pca.components_[2]
+                def create_axis_line(origin, direction, color):
+                    scale = 0.05
+                    line = o3d.geometry.LineSet()
+                    line.points = o3d.utility.Vector3dVector([origin, origin + direction * scale])
+                    line.lines = o3d.utility.Vector2iVector([[0, 1]])
+                    line.colors = o3d.utility.Vector3dVector([color])
+                    return line
 
-                    center = np.mean(sub_pts, axis=0)
-                    angle_deg_y = self.calculate_y_axis_angle_xy(minor_axis)
-                    dom_color = self.get_dominant_color(sub_cols)
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(sub_pts)
+                pcd.colors = o3d.utility.Vector3dVector(sub_cols)
+                geometries.append(pcd)
+                geometries.append(create_axis_line(center, major_axis, [1, 0, 0]))
+                geometries.append(create_axis_line(center, minor_axis, [0, 1, 0]))
+                geometries.append(create_axis_line(center, normal_axis, [0, 0, 1]))
 
-                    results.append((center, dom_color, angle_deg_y, label))
-
-                    # Visuals
-                    def create_axis_line(origin, direction, color):
-                        scale = 0.05
-                        line = o3d.geometry.LineSet()
-                        line.points = o3d.utility.Vector3dVector([origin, origin + direction * scale])
-                        line.lines = o3d.utility.Vector2iVector([[0, 1]])
-                        line.colors = o3d.utility.Vector3dVector([color])
-                        return line
-
-                    pcd = o3d.geometry.PointCloud()
-                    pcd.points = o3d.utility.Vector3dVector(sub_pts)
-                    pcd.colors = o3d.utility.Vector3dVector(sub_cols)
-                    geometries.append(pcd)
-                    geometries.append(create_axis_line(center, major_axis, [1, 0, 0]))
-                    geometries.append(create_axis_line(center, minor_axis, [0, 1, 0]))
-                    geometries.append(create_axis_line(center, normal_axis, [0, 0, 1]))
-
-        # Visualization
         if geometries:
             axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1, origin=[0, 0, 0])
             o3d.visualization.draw_geometries([axes] + geometries, window_name="Filtered Clusters")
 
-        # Save results to file
         with open(summary_file, "w") as f:
             for center, color, angle, label in results:
                 cx, cy, cz = center * 1000.0
                 r_, g_, b_ = color
                 f.write(f"{cx:.2f} {cy:.2f} {cz:.2f} {r_:.6f} {g_:.6f} {b_:.6f} {angle:.2f} {label}\n")
+
 
     # def send_file_via_tcp(self, file_path):
     #     filename = os.path.basename(file_path).encode('utf-8')
@@ -401,10 +389,14 @@ class BinPickingSystem:
             print("[PIPELINE] 유효 포인트가 없어 종료.")
             return
         print("1")
+        
+        # Creating files with their corresponding time stamp
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         transformed_file = os.path.join(self.output_dir, f"Transformed_ROI_point_cloud_{timestamp_str}.txt")
         summary_file = os.path.join(self.output_dir, f"Cluster_Summary_{timestamp_str}.txt")
         image_file = os.path.join(self.output_dir, f"PointCloud_Img_{timestamp_str}.png")
+        
+        # Saving data into created files
         print("2")
         self.save_transformed_point_cloud(points, colors, transformed_file)
         print("3")
@@ -416,56 +408,59 @@ class BinPickingSystem:
         # self.send_file_via_tcp(summary_file)
         # print("[PIPELINE] 모든 공정이 완료되었습니다.")
     
+    
+    
     # Collecting RGB data from bricks
-    def collect_rgb_statistics(self, sample_count=200):
-        print(f"[COLOR SAMPLING] Starting collection of {sample_count} samples...")
-        all_colors = []
+    # def collect_rgb_statistics(self, sample_count=200):
+    #     print(f"[COLOR SAMPLING] Starting collection of {sample_count} samples...")
+    #     all_colors = []
 
-        for i in range(sample_count):
-            print(f"[{i+1}/{sample_count}] Capturing frame...")
-            points, colors = self.capture_and_preprocess_kinect_data()
+    #     for i in range(sample_count):
+    #         print(f"[{i+1}/{sample_count}] Capturing frame...")
+    #         points, colors = self.capture_and_preprocess_kinect_data()
 
-            if len(points) == 0:
-                print(" - No valid points, skipping...")
-                continue
+    #         if len(points) == 0:
+    #             print(" - No valid points, skipping...")
+    #             continue
 
-            all_colors.append(colors)
+    #         all_colors.append(colors)
 
-        if len(all_colors) == 0:
-            print("[COLOR SAMPLING] No color data collected.")
-            return
+    #     if len(all_colors) == 0:
+    #         print("[COLOR SAMPLING] No color data collected.")
+    #         return
 
-        # Concatenate all color arrays
-        all_colors_np = np.concatenate(all_colors, axis=0)
+    #     # Concatenate all color arrays
+    #     all_colors_np = np.concatenate(all_colors, axis=0)
 
-        # Mean
-        mean_rgb = np.mean(all_colors_np, axis=0)
+    #     # Mean
+    #     mean_rgb = np.mean(all_colors_np, axis=0)
 
-        # Standard deviation
-        std_rgb = np.std(all_colors_np, axis=0)
+    #     # Standard deviation
+    #     std_rgb = np.std(all_colors_np, axis=0)
 
-        # Min and Max
-        min_rgb = np.min(all_colors_np, axis=0)
-        max_rgb = np.max(all_colors_np, axis=0)
+    #     # Min and Max
+    #     min_rgb = np.min(all_colors_np, axis=0)
+    #     max_rgb = np.max(all_colors_np, axis=0)
 
-        # Print results
-        print("\n[COLOR STATISTICS]")
-        print(f"Mean RGB: R={mean_rgb[0]:.3f}, G={mean_rgb[1]:.3f}, B={mean_rgb[2]:.3f}")
-        print(f"Std  RGB: R={std_rgb[0]:.3f}, G={std_rgb[1]:.3f}, B={std_rgb[2]:.3f}")
-        print(f"Min  RGB: R={min_rgb[0]:.3f}, G={min_rgb[1]:.3f}, B={min_rgb[2]:.3f}")
-        print(f"Max  RGB: R={max_rgb[0]:.3f}, G={max_rgb[1]:.3f}, B={max_rgb[2]:.3f}")
+    #     # Print results
+    #     print("\n[COLOR STATISTICS]")
+    #     print(f"Mean RGB: R={mean_rgb[0]:.3f}, G={mean_rgb[1]:.3f}, B={mean_rgb[2]:.3f}")
+    #     print(f"Std  RGB: R={std_rgb[0]:.3f}, G={std_rgb[1]:.3f}, B={std_rgb[2]:.3f}")
+    #     print(f"Min  RGB: R={min_rgb[0]:.3f}, G={min_rgb[1]:.3f}, B={min_rgb[2]:.3f}")
+    #     print(f"Max  RGB: R={max_rgb[0]:.3f}, G={max_rgb[1]:.3f}, B={max_rgb[2]:.3f}")
 
-        # Save results to file
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_path = os.path.join(self.output_dir, f"rgb_statistics_{timestamp}.txt")
-        with open(save_path, "w") as f:
-            f.write("[COLOR STATISTICS]\n")
-            f.write(f"Mean RGB: {mean_rgb[0]:.6f} {mean_rgb[1]:.6f} {mean_rgb[2]:.6f}\n")
-            f.write(f"Std  RGB: {std_rgb[0]:.6f} {std_rgb[1]:.6f} {std_rgb[2]:.6f}\n")
-            f.write(f"Min  RGB: {min_rgb[0]:.6f} {min_rgb[1]:.6f} {min_rgb[2]:.6f}\n")
-            f.write(f"Max  RGB: {max_rgb[0]:.6f} {max_rgb[1]:.6f} {max_rgb[2]:.6f}\n")
-        print(f"[COLOR SAMPLING] Saved to {save_path}")
-        
+    #     # Save results to file
+    #     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    #     save_path = os.path.join(self.output_dir, f"rgb_statistics_{timestamp}.txt")
+    #     with open(save_path, "w") as f:
+    #         f.write("[COLOR STATISTICS]\n")
+    #         f.write(f"Mean RGB: {mean_rgb[0]:.6f} {mean_rgb[1]:.6f} {mean_rgb[2]:.6f}\n")
+    #         f.write(f"Std  RGB: {std_rgb[0]:.6f} {std_rgb[1]:.6f} {std_rgb[2]:.6f}\n")
+    #         f.write(f"Min  RGB: {min_rgb[0]:.6f} {min_rgb[1]:.6f} {min_rgb[2]:.6f}\n")
+    #         f.write(f"Max  RGB: {max_rgb[0]:.6f} {max_rgb[1]:.6f} {max_rgb[2]:.6f}\n")
+    #     print(f"[COLOR SAMPLING] Saved to {save_path}")
+
+# Main Program
 if __name__ == "__main__":
     # 예: WADF 경로가 필요 없는 경우 빈 문자열로 초기화하거나 필요 시 경로 지정
     system = BinPickingSystem(wdf_path="")
