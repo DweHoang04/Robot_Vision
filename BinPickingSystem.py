@@ -5,10 +5,12 @@ import cv2
 import numpy as np
 import open3d as o3d
 import struct
+import scipy.spatial
 from datetime import datetime
 from collections import Counter
 from sklearn.cluster import DBSCAN
 from sklearn.decomposition import PCA
+from scipy.spatial.transform import Rotation as R
 
 from pykinect2 import PyKinectRuntime, PyKinectV2
 from pykinect2.PyKinectV2 import *
@@ -17,6 +19,9 @@ class BinPickingSystem:
 
     def __init__(self, wdf_path):
         self.output_dir = "C:\\Binpicking"
+        # Create the output directory if it doesn't exist
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
         self.host = "192.168.1.23"
         self.port = 9999
 
@@ -100,8 +105,8 @@ class BinPickingSystem:
                                                  num_iterations=ransac_iter)
         non_plane_cloud = pcd.select_by_index(inliers, invert=True)
         above_points, above_colors = self.keep_points_above_plane(np.asarray(non_plane_cloud.points),
-                                                                  np.asarray(non_plane_cloud.colors),
-                                                                  plane_model)
+                                                                 np.asarray(non_plane_cloud.colors),
+                                                                 plane_model)
         if len(above_points) == 0:
             return np.array([]), np.array([])
 
@@ -138,44 +143,101 @@ class BinPickingSystem:
         vis.update_geometry(pcd)
         vis.poll_events()
         vis.update_renderer()
-        time.sleep(0.1)  # 렌더링 안정화
+        time.sleep(0.1)  # Stabilize rendering
         vis.capture_screen_image(image_path)
         vis.destroy_window()
-    '''    
-    # 마이너스면 왼쪽으로 돌고 플러스면 오른쪽으로 돈다.
+
     def calculate_y_axis_angle_xy(self, minor_axis):
-        ref_axis = np.array([0, 1])
-        v2d = minor_axis[:2] / np.linalg.norm(minor_axis[:2])
-        angle_deg = np.degrees(np.arccos(np.clip(np.dot(v2d, ref_axis), -1.0, 1.0)))
-        if v2d[0] < 0:
-            angle_deg = -angle_deg
-        return angle_deg
-    '''
-    def calculate_y_axis_angle_xy(self, minor_axis):
-        # 단위 벡터로 정규화
+        # Normalize to a unit vector
         v2d = minor_axis[:2] / np.linalg.norm(minor_axis[:2])
 
         def clockwise_angle_from_y(vec):
-            # Y축 기준 시계방향 회전각도 (0~360)
+            # Clockwise angle from Y-axis (0-360)
             angle = np.degrees(np.arctan2(vec[0], vec[1])) % 360
             return angle
 
         angle1 = clockwise_angle_from_y(v2d)
         angle2 = clockwise_angle_from_y(-v2d)
 
-        # 선(line)이므로 방향성 제거 → 둘 중 더 작은 회전각이 실제 선의 시계방향 회전각
+        # Since it's a line, remove directionality -> the smaller angle is the actual clockwise rotation
         angle_deg = min(angle1, angle2)
-        # 90° 초과 시 보완각으로 변환
+        # If over 90°, convert to complementary angle
         if angle_deg > 90:
             angle_deg = 180 - angle_deg
-            angle_deg = - angle_deg
-        return angle_deg  # 최종적으로 음수 부호 붙여 반환
+            angle_deg = -angle_deg
+        return angle_deg  # Finally, return with a negative sign
 
     def get_dominant_color(self, colors):
         c_int = (colors * 255).astype(int)
         counter = Counter(map(tuple, c_int))
         dom = max(counter, key=counter.get)
         return np.array(dom) / 255.0
+
+    def compute_harris_3d_corners(self, points, k_ring=15, harris_k=0.04, num_corners=8):
+        """
+        Detects 3D Harris corners in a point cloud.
+        This is the newly integrated method.
+        """
+        tree = scipy.spatial.cKDTree(points)
+        harris_responses = []
+
+        for i, v in enumerate(points):
+            _, idxs = tree.query(v, k=k_ring)
+            neighbors = points[idxs]
+
+            if len(neighbors) < 6:
+                harris_responses.append((i, -np.inf))
+                continue
+
+            centroid = np.mean(neighbors, axis=0)
+            centered = neighbors - centroid
+
+            cov = np.cov(centered.T)
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            normal = eigvecs[:, 0]  # smallest eigenvalue → normal vector
+
+            z_axis = np.array([0, 0, 1])
+            axis = np.cross(normal, z_axis)
+            angle = np.arccos(np.clip(np.dot(normal, z_axis), -1.0, 1.0))
+
+            if np.linalg.norm(axis) < 1e-6:
+                rotated = centered
+            else:
+                axis /= np.linalg.norm(axis)
+                rotation = R.from_rotvec(angle * axis)
+                rotated = rotation.apply(centered)
+
+            X = np.column_stack([
+                rotated[:, 0] ** 2,
+                rotated[:, 1] ** 2,
+                rotated[:, 0] * rotated[:, 1],
+                rotated[:, 0],
+                rotated[:, 1],
+                np.ones(rotated.shape[0])
+            ])
+            z = rotated[:, 2]
+
+            try:
+                coeffs, _, _, _ = np.linalg.lstsq(X, z, rcond=None)
+            except np.linalg.LinAlgError:
+                harris_responses.append((i, -np.inf))
+                continue
+
+            a, b, c, d, e, _ = coeffs
+            A = d**2 + 2 * a**2 + 2 * c**2
+            B = e**2 + 2 * b**2 + 2 * c**2
+            C = d * e + 2 * a * c + 2 * c * b
+
+            det_E = A * B - C**2
+            trace_E = A + B
+            harris_val = det_E - harris_k * trace_E ** 2
+            harris_responses.append((i, harris_val))
+
+        # Select top-N points with highest Harris response
+        harris_responses.sort(key=lambda x: x[1], reverse=True)
+        top_idxs = [idx for idx, _ in harris_responses[:num_corners]]
+        return points[top_idxs]
+
 
     def cluster_and_save_summary(self, transformed_file, summary_file,
                                  dbscan_eps=0.01, dbscan_min_samples=10):
@@ -193,31 +255,54 @@ class BinPickingSystem:
             m = (labels == lbl)
             lego_pts = points[m]
             lego_cols = colors[m]
-            print(f"전 : {len(lego_pts)}")
-            # 🔍 클러스터 크기 필터링
+            
+            # 🔍 Filter clusters by size
             if len(lego_pts) < 500:
                 continue
-            print(f"후 : {len(lego_pts)}")
+            
+            print(f"Cluster {lbl}: {len(lego_pts)} points found.")
 
-            # ⬇️ 시각화용 geometry 생성
+            # ⬇️ Create geometry for visualization
             pcd = o3d.geometry.PointCloud()
             pcd.points = o3d.utility.Vector3dVector(lego_pts)
             pcd.colors = o3d.utility.Vector3dVector(lego_cols)
             geometries.append(pcd)
 
-            # ✅ PCA 및 중심/방향 계산
+            # ✅ --- HARRIS CORNER DETECTION ---
+            # Ensure there are enough points to find neighbors
+            if len(lego_pts) > 20:
+                print(f"-> Detecting Harris corners for cluster {lbl}...")
+                corners = self.compute_harris_3d_corners(lego_pts, num_corners=8)
+                print(f"-> Found {len(corners)} corners.")
+
+                # Visualize corners as red spheres
+                if len(corners) > 0:
+                    corner_pcd = o3d.geometry.PointCloud()
+                    corner_pcd.points = o3d.utility.Vector3dVector(corners)
+                    # Create spheres for better visibility
+                    corner_spheres = o3d.geometry.TriangleMesh()
+                    for corner_pt in corners:
+                        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.005)
+                        sphere.translate(corner_pt)
+                        corner_spheres += sphere
+                    corner_spheres.paint_uniform_color([1.0, 0.0, 0.0]) # Red
+                    geometries.append(corner_spheres)
+            # --- END OF HARRIS CORNER INTEGRATION ---
+
+            # ✅ PCA and center/direction calculation
             pca = PCA(n_components=3).fit(lego_pts)
             center = np.mean(lego_pts, axis=0)
             angle_deg = self.calculate_y_axis_angle_xy(pca.components_[1])
             dom_color = self.get_dominant_color(lego_cols)
             results.append((center, dom_color, angle_deg))
 
-        # # 🧩 시각화
-        # if geometries:
-        #     axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1, origin=[0, 0, 0])
-        #     o3d.visualization.draw_geometries([axes] + geometries, window_name="Filtered Clusters")
+        # 🧩 --- VISUALIZATION ENABLED ---
+        if geometries:
+            print("Visualizing results...")
+            axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1, origin=[0, 0, 0])
+            o3d.visualization.draw_geometries([axes] + geometries, window_name="Filtered Clusters with Harris Corners")
 
-        # 💾 파일 저장
+        # 💾 Save summary file
         with open(summary_file, "w") as f:
             for center, color, angle in results:
                 cx, cy, cz = center * 1000.0
@@ -235,28 +320,38 @@ class BinPickingSystem:
             s.sendall(file_data)
 
     def run_pipeline(self):
-        print("0")
+        print("0. Starting pipeline...")
         points, colors = self.capture_and_preprocess_kinect_data()
         if len(points) == 0:
-            print("[PIPELINE] 유효 포인트가 없어 종료.")
+            print("[PIPELINE] No valid points found after preprocessing. Exiting.")
             return
-        print("1")
+        
+        print("1. Data captured and preprocessed.")
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         transformed_file = os.path.join(self.output_dir, f"Transformed_ROI_point_cloud_{timestamp_str}.txt")
         summary_file = os.path.join(self.output_dir, f"Cluster_Summary_{timestamp_str}.txt")
         image_file = os.path.join(self.output_dir, f"PointCloud_Img_{timestamp_str}.png")
-        print("2")
+        
+        print("2. Saving transformed point cloud...")
         self.save_transformed_point_cloud(points, colors, transformed_file)
-        print("3")
+        
+        print("3. Saving point cloud image...")
         self.save_cloud_image(points, colors, image_file)
-        print("4")
+        
+        print("4. Clustering, detecting corners, and saving summary...")
         self.cluster_and_save_summary(transformed_file, summary_file)
-        print("5")
-        # 🔻 서버 전송 기능은 주석 처리
-        self.send_file_via_tcp(summary_file)
-        print("[PIPELINE] 모든 공정이 완료되었습니다.")
+        
+        print("5. Sending summary file to server...")
+        # 🔻 Server transfer function is active
+        try:
+            self.send_file_via_tcp(summary_file)
+            print("[PIPELINE] Summary file sent successfully.")
+        except Exception as e:
+            print(f"[ERROR] Failed to send file to server: {e}")
+
+        print("[PIPELINE] All processes completed.")
         
 if __name__ == "__main__":
-    # 예: WADF 경로가 필요 없는 경우 빈 문자열로 초기화하거나 필요 시 경로 지정
+    # The wdf_path is not used in the current implementation, so passing an empty string is fine.
     system = BinPickingSystem(wdf_path="")
     system.run_pipeline()
