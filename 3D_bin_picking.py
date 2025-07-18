@@ -207,7 +207,7 @@ class BinPickingSystem:
                 f.write(f"{points[i, 0]:.6f} {points[i, 1]:.6f} {points[i, 2]:.6f} "
                        f"{colors_255[i, 0]} {colors_255[i, 1]} {colors_255[i, 2]}\n")
         
-        print(f"Saved PLY file: {output_file}")
+        print(f"Saved PLY file with timestamp: {output_file}")
 
     def save_cloud_image(self, points, colors, image_path):
         pcd = o3d.geometry.PointCloud()
