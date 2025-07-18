@@ -26,16 +26,7 @@ class BinPickingSystem:
 
     # Initializing (This part is for the robot arm so it is not necessary)
     def __init__(self, wdf_path, output_dir=None):
-        # Use provided output directory or create a default one
-        if output_dir is None:
-            self.output_dir = os.path.join(os.getcwd(), "Results")
-        else:
-            self.output_dir = output_dir
-        
-        # Create the output directory if it doesn't exist
-        if not os.path.exists(self.output_dir):
-            os.makedirs(self.output_dir)
-            print(f"Created output directory: {self.output_dir}")
+        self.output_dir = "C:\\Users\\FILAB\\Desktop\\DUY\\Results" # Data saving location
         # self.host = "192.168.1.23" # Target IP for sending data to the robot arm
         # self.port = 9999 # Target (Robot arm) port
 
