@@ -9,6 +9,8 @@ import struct # Convert Python values to C struct to communicate with sensors (I
 import scipy.spatial
 from datetime import datetime # Time operation
 from collections import Counter
+import itertools
+from scipy.spatial import Delaunay
 
 # Image processing Libraries
 from sklearn.cluster import DBSCAN # Density-based clustering algorithm (Used for grouping similar 3D point)
@@ -23,11 +25,17 @@ from pykinect2.PyKinectV2 import *
 class BinPickingSystem:
 
     # Initializing (This part is for the robot arm so it is not necessary)
-    def __init__(self, wdf_path):
-        self.output_dir = "C:\\Users\\FILAB\\Desktop\\DUY\\Results" # Data saving location
+    def __init__(self, wdf_path, output_dir=None):
+        # Use provided output directory or create a default one
+        if output_dir is None:
+            self.output_dir = os.path.join(os.getcwd(), "Results")
+        else:
+            self.output_dir = output_dir
+        
         # Create the output directory if it doesn't exist
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
+            print(f"Created output directory: {self.output_dir}")
         # self.host = "192.168.1.23" # Target IP for sending data to the robot arm
         # self.port = 9999 # Target (Robot arm) port
 
@@ -171,6 +179,45 @@ class BinPickingSystem:
         data = np.hstack([points, colors])
         np.savetxt(output_file, data, delimiter=' ', fmt='%f')
 
+    def save_point_cloud_as_ply(self, points, colors, output_file):
+        """
+        Save point cloud data as PLY file format for compatibility with 3D_Harris_IPD tools
+        """
+        # Ensure we have valid data
+        if len(points) == 0 or len(colors) == 0:
+            print("No data to save as PLY file")
+            return
+            
+        # Create PLY header
+        header = [
+            "ply",
+            "format ascii 1.0",
+            f"element vertex {len(points)}",
+            "property float x",
+            "property float y", 
+            "property float z",
+            "property uchar red",
+            "property uchar green",
+            "property uchar blue",
+            "end_header"
+        ]
+        
+        # Convert colors to 0-255 range
+        colors_255 = (colors * 255).astype(np.uint8)
+        
+        # Write PLY file
+        with open(output_file, 'w') as f:
+            # Write header
+            for line in header:
+                f.write(line + '\n')
+            
+            # Write vertex data
+            for i in range(len(points)):
+                f.write(f"{points[i, 0]:.6f} {points[i, 1]:.6f} {points[i, 2]:.6f} "
+                       f"{colors_255[i, 0]} {colors_255[i, 1]} {colors_255[i, 2]}\n")
+        
+        print(f"Saved PLY file: {output_file}")
+
     def save_cloud_image(self, points, colors, image_path):
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points)
@@ -215,73 +262,219 @@ class BinPickingSystem:
         dom = max(counter, key=counter.get)
         return np.array(dom) / 255.0 # Normalizing it to float type
 
-    def compute_harris_3d_corners(self, points, k_ring=6, harris_k=0.02, num_corners=8):
-        """
-        Detects 3D Harris corners in a point cloud.
-        This is the newly integrated method.
-        """
-        tree = scipy.spatial.cKDTree(points)
-        harris_responses = []
+    # Helper functions for improved 3D Harris corner detection
+    def polyfit3d(self, x, y, z, order=2):
+        """Fit a 3D polynomial surface to the data points"""
+        ncols = (order + 1)**2
+        G = np.zeros((x.size, ncols))
+        ij = itertools.product(range(order+1), range(order+1))
+        for k, (i, j) in enumerate(ij):
+            G[:, k] = x**i * y**j
+        m, _, _, _ = np.linalg.lstsq(G, z, rcond=None)
+        return m
 
-        for i, v in enumerate(points):
-            _, idxs = tree.query(v, k=k_ring)
-            neighbors = points[idxs]
+    def compute_delaunay_neighborhood(self, points, delta=0.025, max_iter=5):
+        """Compute adaptive neighborhoods using Delaunay triangulation"""
+        if len(points) < 4:  # Need at least 4 points for Delaunay triangulation
+            return {}
+            
+        try:
+            triangulation = Delaunay(points)
+        except:
+            # Fall back to simple k-NN if Delaunay fails
+            return self.compute_knn_neighborhood(points, k=6)
 
-            if len(neighbors) < 6:
-                harris_responses.append((i, -np.inf))
-                continue
+        # Build direct neighborhood from Delaunay triangulation
+        neighborhood_direct = {}
+        for f in triangulation.simplices:
+            for v in range(f.shape[0]):
+                faces = list(f.copy())
+                faces.pop(v)
+                if f[v] in neighborhood_direct.keys():
+                    neighborhood_direct[f[v]] = list(np.unique(neighborhood_direct[f[v]] + faces))
+                else:
+                    neighborhood_direct[f[v]] = faces
 
-            centroid = np.mean(neighbors, axis=0)
-            centered = neighbors - centroid
-
-            cov = np.cov(centered.T)
-            eigvals, eigvecs = np.linalg.eigh(cov)
-            normal = eigvecs[:, 0]  # smallest eigenvalue → normal vector
-
-            z_axis = np.array([0, 0, 1])
-            axis = np.cross(normal, z_axis)
-            angle = np.arccos(np.clip(np.dot(normal, z_axis), -1.0, 1.0))
-
-            if np.linalg.norm(axis) < 1e-6:
-                rotated = centered
+        # Adaptive k-ring expansion
+        neighborhood = {}
+        for v in neighborhood_direct.keys():
+            query = points[v]
+            # Compute the distance of the query and its ring
+            if len(neighborhood_direct[v]) > 0:
+                dist = np.max(np.linalg.norm(query - points[neighborhood_direct[v]], axis=1))
+                if dist >= delta:
+                    bigger_ring = False
+                    neighborhood[v] = neighborhood_direct[v]
+                else:
+                    bigger_ring = True
             else:
-                axis /= np.linalg.norm(axis)
-                rotation = R.from_rotvec(angle * axis)
-                rotated = rotation.apply(centered)
+                bigger_ring = False
+                neighborhood[v] = [v]  # At least include the point itself
 
-            X = np.column_stack([
-                rotated[:, 0] ** 2,
-                rotated[:, 1] ** 2,
-                rotated[:, 0] * rotated[:, 1],
-                rotated[:, 0],
-                rotated[:, 1],
-                np.ones(rotated.shape[0])
-            ])
-            z = rotated[:, 2]
+            iteration = 1
+            while bigger_ring and iteration <= max_iter:
+                iteration += 1
+                for neighbor in neighborhood_direct[v]:
+                    if neighbor in neighborhood_direct:
+                        if v in neighborhood.keys():
+                            neighborhood[v] = list(np.unique(neighborhood[v] + neighborhood_direct[neighbor]))
+                        else:
+                            neighborhood[v] = list(np.unique(neighborhood_direct[v] + neighborhood_direct[neighbor]))
 
+                # Compute the distance of the query and its ring
+                if len(neighborhood[v]) > 0:
+                    dist = np.max(np.linalg.norm(query - points[neighborhood[v]], axis=1))
+                    if dist >= delta:
+                        bigger_ring = False
+                    else:
+                        bigger_ring = True
+                else:
+                    bigger_ring = False
+
+        return neighborhood
+
+    def compute_knn_neighborhood(self, points, k=6):
+        """Fallback k-NN neighborhood computation"""
+        neighborhoods = {}
+        for i, query in enumerate(points):
+            dist = np.linalg.norm(query - points, axis=1)
+            sample_idx = []
+            for _ in range(min(k, len(points))):
+                idx = np.argmin(dist)
+                sample_idx.append(idx)
+                dist[idx] = np.inf
+            neighborhoods[i] = sample_idx
+        return neighborhoods
+
+    def compute_harris_3d_corners(self, points, delta=0.025, harris_k=0.04, fraction=0.1, cluster_threshold=0.01, num_corners=8):
+        """
+        Improved 3D Harris corner detection based on the 3D_Harris_IPD implementation.
+        
+        Parameters:
+        - points: numpy array of 3D points
+        - delta: neighborhood size parameter for adaptive k-ring
+        - harris_k: Harris corner detection parameter
+        - fraction: fraction of points to select as corners
+        - cluster_threshold: minimum distance between corners for clustering
+        - num_corners: maximum number of corners to return
+        """
+        if len(points) < 10:
+            print("Not enough points for Harris corner detection")
+            return np.array([])
+
+        print(f"Computing Harris corners for {len(points)} points...")
+        
+        # Compute neighborhoods using adaptive Delaunay triangulation
+        neighborhood = self.compute_delaunay_neighborhood(points, delta=delta)
+        
+        if len(neighborhood) == 0:
+            print("Failed to compute neighborhoods, falling back to k-NN")
+            neighborhood = self.compute_knn_neighborhood(points, k=6)
+        
+        # Initialize response array
+        resp = np.zeros(len(points))
+        
+        # Compute Harris response for each point
+        for point_idx in neighborhood.keys():
             try:
-                coeffs, _, _, _ = np.linalg.lstsq(X, z, rcond=None)
-            except np.linalg.LinAlgError:
-                harris_responses.append((i, -np.inf))
+                if len(neighborhood[point_idx]) < 3:
+                    resp[point_idx] = -np.inf
+                    continue
+                    
+                neighbors = points[neighborhood[point_idx], :]
+                
+                # Center the neighbors
+                neighbors_centred = neighbors - np.mean(neighbors, axis=0)
+                
+                # Principal Component Analysis
+                pca = PCA(n_components=3)
+                neighbors_pca = pca.fit_transform(neighbors_centred)
+                eigenvalues, eigenvectors = np.linalg.eigh(pca.components_)
+                
+                # Get the best fitting normal (smallest eigenvalue)
+                idx = np.argmin(eigenvalues)
+                best_fit_normal = eigenvectors[idx, :]
+                
+                # Rotate the cloud to align with the normal
+                rotated_neighbors = neighbors.copy()
+                for i in range(neighbors.shape[0]):
+                    rotated_neighbors[i, :] = np.dot(np.transpose(eigenvectors), neighbors[i, :])
+                
+                # Restrict to XY plane and translate
+                neighbors_2D = rotated_neighbors[:, :2] - rotated_neighbors[0, :2]
+                
+                # Fit a quadratic surface z = f(x,y)
+                if len(neighbors_2D) >= 6:  # Need at least 6 points for quadratic fitting
+                    m = self.polyfit3d(neighbors_2D[:, 0], neighbors_2D[:, 1], rotated_neighbors[:, 2], order=2)
+                    m = m.reshape((3, 3))
+                    
+                    # Compute the Harris response using the fitted surface derivatives
+                    # These are the second derivatives of the surface
+                    fx2 = m[2, 0]**2 + 2*m[1, 1]**2 + 2*m[0, 2]**2  # A
+                    fy2 = m[0, 2]**2 + 2*m[1, 1]**2 + 2*m[2, 0]**2  # B
+                    fxfy = m[2, 0]*m[0, 2] + 2*m[1, 1]**2  # C
+                    
+                    # Harris corner response
+                    resp[point_idx] = fx2 * fy2 - fxfy * fxfy - harris_k * (fx2 + fy2) * (fx2 + fy2)
+                else:
+                    resp[point_idx] = -np.inf
+                    
+            except Exception as e:
+                resp[point_idx] = -np.inf
                 continue
-
-            a, b, c, d, e, _ = coeffs
-            A = d**2 + 2 * a**2 + 2 * c**2
-            B = e**2 + 2 * b**2 + 2 * c**2
-            C = d * e + 2 * a * c + 2 * c * b
-
-            det_E = A * B - C**2
-            trace_E = A + B
-            harris_val = det_E - harris_k * trace_E ** 2
-            harris_responses.append((i, harris_val))
-
-        # Select top-N points with highest Harris response
-        harris_responses.sort(key=lambda x: x[1], reverse=True)
-        top_idxs = [idx for idx, _ in harris_responses[:num_corners]]
-        return points[top_idxs]
+        
+        # Select interest points - find local maxima
+        candidate = []
+        for point_idx in neighborhood.keys():
+            if len(neighborhood[point_idx]) > 0:
+                neighbor_responses = resp[neighborhood[point_idx]]
+                if resp[point_idx] >= np.max(neighbor_responses):
+                    candidate.append([point_idx, resp[point_idx]])
+        
+        if len(candidate) == 0:
+            print("No corner candidates found")
+            return np.array([])
+        
+        # Sort by decreasing Harris response
+        candidate.sort(reverse=True, key=lambda x: x[1])
+        candidate = np.array(candidate)
+        
+        # Method 1: Select top fraction of points
+        num_fraction = max(1, int(fraction * len(points)))
+        interest_points_fraction = candidate[:num_fraction, 0].astype(int)
+        
+        # Method 2: Cluster-based selection (avoid points too close to each other)
+        selected_corners = []
+        if len(candidate) > 0:
+            # Start with the best corner
+            selected_corners.append(int(candidate[0, 0]))
+            Q = points[int(candidate[0, 0]), :].reshape((1, -1))
+            
+            # Add corners that are far enough from existing ones
+            for i in range(1, len(candidate)):
+                query = points[int(candidate[i, 0]), :].reshape((1, -1))
+                distances = scipy.spatial.distance.cdist(query, Q, metric='euclidean')
+                if np.min(distances) > cluster_threshold:
+                    selected_corners.append(int(candidate[i, 0]))
+                    Q = np.concatenate((Q, query), axis=0)
+                    
+                    # Stop if we have enough corners
+                    if len(selected_corners) >= num_corners:
+                        break
+        
+        # Return the selected corner points
+        if len(selected_corners) > 0:
+            corner_points = points[selected_corners]
+            print(f"Found {len(corner_points)} Harris corners")
+            return corner_points
+        else:
+            print("No valid corners found after clustering")
+            return np.array([])
 
     def cluster_and_save_summary(self, transformed_file, summary_file,
-                             dbscan_eps=0.01, dbscan_min_samples=10):
+                             dbscan_eps=0.01, dbscan_min_samples=10,
+                             harris_delta=0.02, harris_k=0.04, harris_fraction=0.15,
+                             harris_cluster_threshold=0.008, harris_num_corners=12):
         data = np.loadtxt(transformed_file, delimiter=' ')
         points, colors = data[:, :3], data[:, 3:6]
         dbscan = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples).fit(points)
@@ -309,10 +502,15 @@ class BinPickingSystem:
             pcd.colors = o3d.utility.Vector3dVector(lego_cols)
             geometries.append(pcd)
 
-            # Harris 3D keypoint detection
+            # Harris 3D keypoint detection with improved parameters for LEGO bricks
             if len(lego_pts) > 20:
                 print(f"-> Detecting Harris corners for cluster {lbl}...")
-                corners = self.compute_harris_3d_corners(lego_pts, num_corners=8)
+                corners = self.compute_harris_3d_corners(lego_pts, 
+                                                       delta=harris_delta, 
+                                                       harris_k=harris_k, 
+                                                       fraction=harris_fraction, 
+                                                       cluster_threshold=harris_cluster_threshold, 
+                                                       num_corners=harris_num_corners)
                 print(f"-> Found {len(corners)} corners.")
 
                 if len(corners) > 0:
@@ -371,11 +569,22 @@ class BinPickingSystem:
         print("2. Saving transformed point cloud...")
         self.save_transformed_point_cloud(points, colors, transformed_file)
         
+        # Also save as PLY format for compatibility with 3D_Harris_IPD tools
+        ply_file = os.path.join(self.output_dir, f"Transformed_ROI_point_cloud_{timestamp_str}.ply")
+        self.save_point_cloud_as_ply(points, colors, ply_file)
+        
         print("3. Saving point cloud image...")
         self.save_cloud_image(points, colors, image_file)
         
         print("4. Clustering, detecting corners, and saving summary...")
-        self.cluster_and_save_summary(transformed_file, summary_file)
+        # Use parameters optimized for LEGO bricks detection
+        self.cluster_and_save_summary(transformed_file, summary_file,
+                                    dbscan_eps=0.01, dbscan_min_samples=10,
+                                    harris_delta=0.02,  # Smaller neighborhood for LEGO brick details
+                                    harris_k=0.04,      # Standard Harris parameter
+                                    harris_fraction=0.15, # Select more potential corners
+                                    harris_cluster_threshold=0.008, # Closer corners allowed for LEGO
+                                    harris_num_corners=12)  # More corners per brick
         
         print("5. Sending summary file to server...")
         # Server transfer function is commented out
