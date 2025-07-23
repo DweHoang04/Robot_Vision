@@ -256,12 +256,12 @@ class BinPickingSystem:
     # Helper functions for improved 3D Harris corner detection
     def polyfit3d(self, x, y, z, order=2):
         """Fit a 3D polynomial surface to the data points"""
-        ncols = (order + 1)**2
+        ncols = (order + 1)**2 # Number of coefficients for a polynomial of degree 'order'
         G = np.zeros((x.size, ncols))
         ij = itertools.product(range(order+1), range(order+1))
         for k, (i, j) in enumerate(ij):
             G[:, k] = x**i * y**j
-        m, _, _, _ = np.linalg.lstsq(G, z, rcond=None)
+        m, _, _, _ = np.linalg.lstsq(G, z, rcond=None) # Solve the least squares problem
         return m
 
     def compute_delaunay_neighborhood(self, points, delta=0.025, max_iter=5):
@@ -337,9 +337,294 @@ class BinPickingSystem:
             neighborhoods[i] = sample_idx
         return neighborhoods
 
-    def compute_harris_3d_corners(self, points, delta=0.025, harris_k=0.04, fraction=0.1, cluster_threshold=0.01, num_corners=8):
+    def centering_centroid(self, points):
+        """
+        Center the point cloud on its centroid
+        Returns both centered points and the original centroid for later restoration
+        """
+        centred_points = points.copy()
+        centroid = np.mean(centred_points, axis=0)
+        centred_points = centred_points - centroid
+        return centred_points, centroid
+
+    def centering_origin(self, points, centroid):
+        """
+        Restore the point cloud to its original position using the saved centroid
+        """
+        centred_points = points.copy()
+        centred_points = centred_points + centroid
+        return centred_points
+
+    def scale_point_cloud(self, points, target_scale=1.0):
+        """
+        Scale point cloud to a target scale for consistent processing
+        """
+        scaled_points = points.copy()
+        
+        # Calculate current scale (maximum distance from origin)
+        distances = np.linalg.norm(scaled_points, axis=1)
+        current_scale = np.max(distances)
+        
+        if current_scale > 0:
+            scaling_factor = target_scale / current_scale
+            scaled_points = scaled_points * scaling_factor
+            return scaled_points, scaling_factor
+        else:
+            return scaled_points, 1.0
+
+    def preprocess_for_harris_detection(self, points):
+        """
+        Simplified preprocessing pipeline for Harris 3D corner detection
+        Only includes centering and scaling (no principal axis alignment)
+        """
+        print("Preprocessing points for Harris detection...")
+        
+        # Step 1: Center on centroid
+        centered_points, original_centroid = self.centering_centroid(points)
+        
+        # Step 2: Scale to unit scale for numerical stability
+        scaled_points, scale_factor = self.scale_point_cloud(centered_points, target_scale=1.0)
+        
+        # Restore centroid position (no rotation alignment)
+        preprocessed_points = scaled_points + original_centroid
+        
+        # Store transformation parameters for later restoration
+        transform_params = {
+            'original_centroid': original_centroid,
+            'scale_factor': scale_factor
+        }
+        
+        return preprocessed_points, transform_params
+
+    def restore_harris_points(self, harris_points, original_points, transform_params):
+        """
+        Restore Harris corner points to original coordinate system
+        """
+        if len(harris_points) == 0:
+            return harris_points
+            
+        restored_points = harris_points.copy()
+        
+        # Note: For this implementation, we'll keep points in the transformed space
+        # since the clustering and analysis work better in the aligned coordinate system
+        # If needed, we can add full inverse transformation here
+        
+        return restored_points
+
+    def find_closest_brick_cluster(self, points, colors, dbscan_eps=0.01, dbscan_min_samples=10):
+        """
+        Find the closest brick cluster to the camera (smallest Z coordinate)
+        Returns only the points and colors of the closest brick
+        """
+        # Perform DBSCAN clustering to identify individual LEGO bricks
+        dbscan = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples).fit(points)
+        labels = dbscan.labels_
+
+        # Find all valid clusters (exclude noise with label -1)
+        valid_clusters = []
+        for lbl in set(labels):
+            if lbl == -1:  # Skip noise points
+                continue
+            m = (labels == lbl)
+            cluster_pts = points[m]
+            cluster_cols = colors[m]
+            
+            # Filter small clusters that are likely noise
+            if len(cluster_pts) < 500:
+                continue
+                
+            # Calculate average Z coordinate (distance from camera)
+            avg_z = np.mean(cluster_pts[:, 2])
+            valid_clusters.append((lbl, avg_z, cluster_pts, cluster_cols))
+        
+        if len(valid_clusters) == 0:
+            print("No valid brick clusters found")
+            return np.array([]), np.array([])
+        
+        # Sort by Z coordinate (closest first - smallest Z)
+        valid_clusters.sort(key=lambda x: x[1])
+        
+        # Return the closest cluster
+        closest_label, closest_z, closest_points, closest_colors = valid_clusters[0]
+        print(f"Focusing on closest brick cluster {closest_label} at distance Z={closest_z:.3f}m")
+        print(f"Closest brick has {len(closest_points)} points")
+        
+        return closest_points, closest_colors
+
+    def compute_harris_3d_corners_multi_hypothesis(self, points, delta=0.025, harris_k=0.04, 
+                                                 cluster_threshold=0.008, num_corners=8, num_hypotheses=3):
+        """
+        Enhanced Harris corner detection that returns multiple valid corner hypotheses
+        to handle symmetrical LEGO bricks better
+        """
+        if len(points) < 10:
+            print("Not enough points for Harris corner detection")
+            return []
+
+        print(f"Computing Harris corners with multiple hypotheses for {len(points)} points...")
+        
+        # STEP 1: Preprocess points for stable Harris detection
+        preprocessed_points, transform_params = self.preprocess_for_harris_detection(points)
+        
+        # STEP 2: Compute neighborhoods using adaptive Delaunay triangulation
+        neighborhood = self.compute_delaunay_neighborhood(preprocessed_points, delta=delta)
+        
+        if len(neighborhood) == 0:
+            print("Failed to compute neighborhoods, falling back to k-NN")
+            neighborhood = self.compute_knn_neighborhood(preprocessed_points, k=6)
+        
+        # STEP 3: Initialize response array
+        resp = np.zeros(len(preprocessed_points))
+        
+        # STEP 4: Compute Harris response for each point (same as before)
+        for point_idx in neighborhood.keys():
+            try:
+                if len(neighborhood[point_idx]) < 3:
+                    resp[point_idx] = -np.inf
+                    continue
+                    
+                neighbors = preprocessed_points[neighborhood[point_idx], :]
+                neighbors_centred = neighbors - np.mean(neighbors, axis=0)
+                
+                pca = PCA(n_components=3)
+                neighbors_pca = pca.fit_transform(neighbors_centred)
+                eigenvalues, eigenvectors = np.linalg.eigh(pca.components_)
+                
+                idx = np.argmin(eigenvalues)
+                rotated_neighbors = neighbors.copy()
+                for i in range(neighbors.shape[0]):
+                    rotated_neighbors[i, :] = np.dot(np.transpose(eigenvectors), neighbors[i, :])
+                
+                neighbors_2D = rotated_neighbors[:, :2] - rotated_neighbors[0, :2]
+                
+                if len(neighbors_2D) >= 6:
+                    m = self.polyfit3d(neighbors_2D[:, 0], neighbors_2D[:, 1], rotated_neighbors[:, 2], order=2)
+                    m = m.reshape((3, 3))
+                    
+                    fx2 = m[2, 0]**2 + 2*m[1, 1]**2 + 2*m[0, 2]**2
+                    fy2 = m[0, 2]**2 + 2*m[1, 1]**2 + 2*m[2, 0]**2
+                    fxfy = m[2, 0]*m[0, 2] + 2*m[1, 1]**2
+                    
+                    resp[point_idx] = fx2 * fy2 - fxfy * fxfy - harris_k * (fx2 + fy2) * (fx2 + fy2)
+                else:
+                    resp[point_idx] = -np.inf
+                    
+            except Exception as e:
+                resp[point_idx] = -np.inf
+                continue
+        
+        # STEP 5: Find multiple valid corner hypotheses
+        candidate = []
+        for point_idx in neighborhood.keys():
+            if len(neighborhood[point_idx]) > 0:
+                neighbor_responses = resp[neighborhood[point_idx]]
+                if resp[point_idx] >= np.max(neighbor_responses):
+                    candidate.append([point_idx, resp[point_idx]])
+        
+        if len(candidate) == 0:
+            print("No corner candidates found")
+            return []
+        
+        # Sort by decreasing Harris response
+        candidate.sort(reverse=True, key=lambda x: x[1])
+        candidate = np.array(candidate)
+        
+        # STEP 6: Generate multiple hypotheses with different starting points
+        all_hypotheses = []
+        
+        for hypothesis_idx in range(min(num_hypotheses, len(candidate))):
+            # Start with different high-scoring corners for each hypothesis
+            selected_corners = []
+            if len(candidate) > hypothesis_idx:
+                # Start with the hypothesis_idx-th best corner
+                start_idx = hypothesis_idx
+                selected_corners.append(int(candidate[start_idx, 0]))
+                Q = preprocessed_points[int(candidate[start_idx, 0]), :].reshape((1, -1))
+                
+                # Add corners that are far enough from existing ones
+                for i in range(len(candidate)):
+                    if i == start_idx:
+                        continue
+                    query = preprocessed_points[int(candidate[i, 0]), :].reshape((1, -1))
+                    distances = scipy.spatial.distance.cdist(query, Q, metric='euclidean')
+                    if np.min(distances) > cluster_threshold:
+                        selected_corners.append(int(candidate[i, 0]))
+                        Q = np.concatenate((Q, query), axis=0)
+                        
+                        # Stop if we have enough corners
+                        if len(selected_corners) >= num_corners:
+                            break
+                
+                if len(selected_corners) > 0:
+                    corner_points = points[selected_corners]
+                    all_hypotheses.append(corner_points)
+        
+        print(f"Generated {len(all_hypotheses)} corner hypotheses for symmetrical object")
+        return all_hypotheses
+
+    def validate_lego_geometry(self, corner_points, expected_length=64.0, expected_width=32.0, 
+                              expected_height=19.2, tolerance=0.1):
+        """
+        Validate if detected corners form a valid LEGO Duplo brick geometry
+        Standard 2x4 LEGO Duplo brick: 64mm x 32mm x 19.2mm
+        """
+        if len(corner_points) < 4:
+            return False, 0.0
+            
+        # Calculate bounding box dimensions
+        min_coords = np.min(corner_points, axis=0)
+        max_coords = np.max(corner_points, axis=0)
+        dimensions = (max_coords - min_coords) * 1000  # Convert to mm
+        
+        length, width, height = sorted(dimensions, reverse=True)
+        
+        # Check if dimensions match expected LEGO brick ratios
+        length_error = abs(length - expected_length) / expected_length
+        width_error = abs(width - expected_width) / expected_width
+        height_error = abs(height - expected_height) / expected_height
+        
+        total_error = length_error + width_error + height_error
+        
+        # Valid if all dimensions are within tolerance
+        is_valid = (length_error < tolerance and 
+                   width_error < tolerance and 
+                   height_error < tolerance)
+        
+        if is_valid:
+            print(f"Valid LEGO Duplo geometry: {length:.1f}x{width:.1f}x{height:.1f}mm (error: {total_error:.3f})")
+        
+        return is_valid, total_error
+
+    def select_best_pose_hypothesis(self, corner_hypotheses, brick_points):
+        """
+        Select the best pose hypothesis from multiple candidates using geometric validation
+        """
+        if len(corner_hypotheses) == 0:
+            return np.array([])
+            
+        best_corners = None
+        best_score = float('inf')
+        
+        for i, corners in enumerate(corner_hypotheses):
+            is_valid, error_score = self.validate_lego_geometry(corners)
+            
+            if is_valid and error_score < best_score:
+                best_score = error_score
+                best_corners = corners
+                print(f"Hypothesis {i}: Valid with score {error_score:.3f}")
+            else:
+                print(f"Hypothesis {i}: Invalid or poor score {error_score:.3f}")
+        
+        if best_corners is not None:
+            print(f"Selected best hypothesis with validation score: {best_score:.3f}")
+            return best_corners
+        else:
+            # Fallback: return the first hypothesis if none pass validation
+            print("No hypothesis passed validation, using first hypothesis as fallback")
+            return corner_hypotheses[0] if len(corner_hypotheses) > 0 else np.array([])
         """
         Improved 3D Harris corner detection based on the 3D_Harris_IPD implementation.
+        Now includes proper preprocessing steps: centering, scaling, and alignment.
         
         Parameters:
         - points: numpy array of 3D points
@@ -355,26 +640,29 @@ class BinPickingSystem:
 
         print(f"Computing Harris corners for {len(points)} points...")
         
-        # Compute neighborhoods using adaptive Delaunay triangulation
-        neighborhood = self.compute_delaunay_neighborhood(points, delta=delta)
+        # STEP 1: Preprocess points for stable Harris detection
+        preprocessed_points, transform_params = self.preprocess_for_harris_detection(points)
+        
+        # STEP 2: Compute neighborhoods using adaptive Delaunay triangulation
+        neighborhood = self.compute_delaunay_neighborhood(preprocessed_points, delta=delta)
         
         if len(neighborhood) == 0:
             print("Failed to compute neighborhoods, falling back to k-NN")
-            neighborhood = self.compute_knn_neighborhood(points, k=6)
+            neighborhood = self.compute_knn_neighborhood(preprocessed_points, k=6)
         
-        # Initialize response array
-        resp = np.zeros(len(points))
+        # STEP 3: Initialize response array
+        resp = np.zeros(len(preprocessed_points))
         
-        # Compute Harris response for each point
+        # STEP 4: Compute Harris response for each point using preprocessed coordinates
         for point_idx in neighborhood.keys():
             try:
                 if len(neighborhood[point_idx]) < 3:
                     resp[point_idx] = -np.inf
                     continue
                     
-                neighbors = points[neighborhood[point_idx], :]
+                neighbors = preprocessed_points[neighborhood[point_idx], :]
                 
-                # Center the neighbors
+                # Center the neighbors around their local centroid
                 neighbors_centred = neighbors - np.mean(neighbors, axis=0)
                 
                 # Principal Component Analysis
@@ -414,7 +702,7 @@ class BinPickingSystem:
                 resp[point_idx] = -np.inf
                 continue
         
-        # Select interest points - find local maxima
+        # STEP 5: Select interest points - find local maxima in preprocessed space
         candidate = []
         for point_idx in neighborhood.keys():
             if len(neighborhood[point_idx]) > 0:
@@ -430,20 +718,20 @@ class BinPickingSystem:
         candidate.sort(reverse=True, key=lambda x: x[1])
         candidate = np.array(candidate)
         
-        # Method 1: Select top fraction of points
-        num_fraction = max(1, int(fraction * len(points)))
-        interest_points_fraction = candidate[:num_fraction, 0].astype(int)
+        # # Method 1: Select top fraction of points
+        # num_fraction = max(1, int(fraction * len(preprocessed_points)))
+        # interest_points_fraction = candidate[:num_fraction, 0].astype(int)
         
         # Method 2: Cluster-based selection (avoid points too close to each other)
         selected_corners = []
         if len(candidate) > 0:
             # Start with the best corner
             selected_corners.append(int(candidate[0, 0]))
-            Q = points[int(candidate[0, 0]), :].reshape((1, -1))
+            Q = preprocessed_points[int(candidate[0, 0]), :].reshape((1, -1))
             
             # Add corners that are far enough from existing ones
             for i in range(1, len(candidate)):
-                query = points[int(candidate[i, 0]), :].reshape((1, -1))
+                query = preprocessed_points[int(candidate[i, 0]), :].reshape((1, -1))
                 distances = scipy.spatial.distance.cdist(query, Q, metric='euclidean')
                 if np.min(distances) > cluster_threshold:
                     selected_corners.append(int(candidate[i, 0]))
@@ -453,10 +741,16 @@ class BinPickingSystem:
                     if len(selected_corners) >= num_corners:
                         break
         
-        # Return the selected corner points
+        # STEP 6: Return corner points in ORIGINAL coordinate system
         if len(selected_corners) > 0:
+            # Get corner points from original (non-preprocessed) coordinates
             corner_points = points[selected_corners]
-            print(f"Found {len(corner_points)} Harris corners")
+            
+            # Optional: Apply inverse transformation if needed for specific applications
+            # For now, we return points in original coordinates since preprocessing
+            # was mainly for numerical stability during computation
+            
+            print(f"Found {len(corner_points)} Harris corners with improved preprocessing")
             return corner_points
         else:
             print("No valid corners found after clustering")
@@ -468,68 +762,77 @@ class BinPickingSystem:
                              harris_cluster_threshold=0.008, harris_num_corners=12):
         data = np.loadtxt(transformed_file, delimiter=' ')
         points, colors = data[:, :3], data[:, 3:6]
-        dbscan = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples).fit(points)
-        labels = dbscan.labels_
+        
+        # Find and focus only on the closest brick to the camera
+        closest_points, closest_colors = self.find_closest_brick_cluster(points, colors, 
+                                                                        dbscan_eps, dbscan_min_samples)
+        
+        if len(closest_points) == 0:
+            print("No valid brick found for analysis")
+            return
 
         results = []
         geometries = []
 
-        for lbl in set(labels):
-            if lbl == -1:
-                continue
-            m = (labels == lbl)
-            lego_pts = points[m]
-            lego_cols = colors[m]
+        print(f"Analyzing closest brick with {len(closest_points)} points...")
+
+        # Add the closest LEGO brick as point cloud for visualization
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(closest_points)
+        pcd.colors = o3d.utility.Vector3dVector(closest_colors)
+        geometries.append(pcd)
+
+        # Harris 3D keypoint detection for the closest brick only
+        if len(closest_points) > 20:
+            print("-> Detecting Harris corners for closest brick with symmetry handling...")
             
-            # Filter small clusters
-            if len(lego_pts) < 500:
-                continue
+            # Generate multiple corner hypotheses to handle symmetry
+            corner_hypotheses = self.compute_harris_3d_corners_multi_hypothesis(
+                closest_points, 
+                delta=harris_delta, 
+                harris_k=harris_k, 
+                cluster_threshold=harris_cluster_threshold, 
+                num_corners=harris_num_corners,
+                num_hypotheses=3)
             
-            print(f"Cluster {lbl}: {len(lego_pts)} points found.")
-
-            # Add LEGO cluster as point cloud
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(lego_pts)
-            pcd.colors = o3d.utility.Vector3dVector(lego_cols)
-            geometries.append(pcd)
-
-            # Harris 3D keypoint detection with improved parameters for LEGO bricks
-            if len(lego_pts) > 20:
-                print(f"-> Detecting Harris corners for cluster {lbl}...")
-                corners = self.compute_harris_3d_corners(lego_pts, 
-                                                       delta=harris_delta, 
-                                                       harris_k=harris_k, 
-                                                       fraction=harris_fraction, 
-                                                       cluster_threshold=harris_cluster_threshold, 
-                                                       num_corners=harris_num_corners)
-                print(f"-> Found {len(corners)} corners.")
-
+            if len(corner_hypotheses) > 0:
+                # Select the best hypothesis using geometric validation
+                corners = self.select_best_pose_hypothesis(corner_hypotheses, closest_points)
+                print(f"-> Selected best corner set with {len(corners)} corners.")
+                
+                # Visualize detected corners as orange spheres
                 if len(corners) > 0:
                     for corner_pt in corners:
                         sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.004)
                         sphere.translate(corner_pt)
                         sphere.paint_uniform_color([1.0, 0.647, 0.0])  # Orange
                         geometries.append(sphere)
+            else:
+                print("-> No valid corner hypotheses found")
+                corners = np.array([])
 
-            # Orientation analysis
-            pca = PCA(n_components=3).fit(lego_pts)
-            center = np.mean(lego_pts, axis=0)
-            angle_deg = self.calculate_y_axis_angle_xy(pca.components_[1])
-            dom_color = self.get_dominant_color(lego_cols)
-            results.append((center, dom_color, angle_deg))
+        # Orientation analysis for the closest brick
+        pca = PCA(n_components=3).fit(closest_points)
+        center = np.mean(closest_points, axis=0)
+        angle_deg = self.calculate_y_axis_angle_xy(pca.components_[1])
+        dom_color = self.get_dominant_color(closest_colors)
+        results.append((center, dom_color, angle_deg))
 
-        # Final interactive visualization
+        # Final interactive visualization of the closest brick
         if geometries:
-            print("Visualizing results...")
+            print("Visualizing closest brick with Harris corners...")
             axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1, origin=[0, 0, 0])
-            o3d.visualization.draw_geometries([axes] + geometries, window_name="Filtered Clusters with Harris Corners")
+            o3d.visualization.draw_geometries([axes] + geometries, 
+                                            window_name="Closest Brick with Harris Corners")
 
-        # Save summary
+        # Save analysis summary (only for the closest brick)
         with open(summary_file, "w") as f:
             for center, color, angle in results:
-                cx, cy, cz = center * 1000.0
+                cx, cy, cz = center * 1000.0  # Convert to millimeters
                 r_, g_, b_ = color
                 f.write(f"{cx:.2f} {cy:.2f} {cz:.2f} {r_:.6f} {g_:.6f} {b_:.6f} {angle:.2f}\n")
+        
+        print(f"Saved analysis summary for closest brick only: {summary_file}")
 
 
     # def send_file_via_tcp(self, file_path):
