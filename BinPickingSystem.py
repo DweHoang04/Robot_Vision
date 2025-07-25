@@ -8,6 +8,8 @@ import struct
 import math
 import itertools
 import scipy.spatial.distance
+import copy
+import pickle
 from datetime import datetime
 from collections import Counter
 from sklearn.cluster import DBSCAN
@@ -999,7 +1001,8 @@ class BinPickingSystem:
         R_combined = Ry @ Rx
         
         # Apply rotation to mesh
-        mesh_rotated = mesh.copy()
+        # Create a copy of the mesh using deepcopy to avoid Open3D version issues
+        mesh_rotated = copy.deepcopy(mesh)
         mesh_rotated.rotate(R_combined, center=(0, 0, 0))
         
         # Create virtual camera setup
@@ -1541,7 +1544,6 @@ class BinPickingSystem:
         
         # Save template database to file
         try:
-            import pickle
             with open(output_path, "wb") as f:
                 pickle.dump(template_database, f)
             print(f"Template database saved successfully to: {output_path}")
@@ -1565,7 +1567,6 @@ class BinPickingSystem:
             template_database: The loaded template database
         """
         try:
-            import pickle
             with open(database_path, "rb") as f:
                 template_database = pickle.load(f)
             
