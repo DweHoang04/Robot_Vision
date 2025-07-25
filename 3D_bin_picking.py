@@ -1299,99 +1299,56 @@ class BinPickingSystem:
         
         return coordinates
 
-    def convert_to_robot_coordinates(self, coordinates, camera_to_robot_transform=None):
+    def save_brick_coordinates(self, coordinates, output_file):
         """
-        Convert brick coordinates from camera coordinate system to robot coordinate system
+        Save brick coordinates to file for robot arm grasping
         
         Args:
             coordinates: Brick coordinates from extract_brick_coordinates()
-            camera_to_robot_transform: 4x4 transformation matrix from camera to robot base
-                                     If None, uses identity (assumes camera and robot frames are aligned)
-        
-        Returns:
-            Brick coordinates in robot coordinate system
+            output_file: Path to save the coordinates file
         """
-        if camera_to_robot_transform is None:
-            # Default: assume camera and robot frames are aligned
-            print("Warning: Using identity transform for camera-to-robot conversion")
-            print("Please calibrate camera-to-robot transformation for accurate coordinates")
-            return coordinates
+        from datetime import datetime
         
-        # Extract position and rotation from coordinates
-        position = np.array(coordinates['position'])
-        R_camera = np.array(coordinates['rotation_matrix'])
-        
-        # Create 4x4 transformation matrix in camera frame
-        T_camera = np.eye(4)
-        T_camera[:3, :3] = R_camera
-        T_camera[:3, 3] = position
-        
-        # Transform to robot coordinate system
-        T_robot = camera_to_robot_transform @ T_camera
-        
-        # Extract robot coordinates
-        robot_position = T_robot[:3, 3]
-        robot_rotation = T_robot[:3, :3]
-        
-        # Extract coordinates in robot frame
-        robot_coordinates = self.extract_brick_coordinates(
-            robot_rotation, robot_position, coordinates['coordinate_system'])
-        
-        # Copy additional information
-        for key in ['template_id', 'template_x_rotation', 'template_y_rotation']:
-            if key in coordinates:
-                robot_coordinates[key] = coordinates[key]
-        
-        robot_coordinates['coordinate_frame'] = 'robot'
-        
-        print("Converted coordinates to robot frame:")
-        print(f"  Robot position (x, y, z): ({robot_coordinates['position'][0]:.3f}, "
-              f"{robot_coordinates['position'][1]:.3f}, {robot_coordinates['position'][2]:.3f}) meters")
-        
-        return robot_coordinates
-
-    def save_brick_coordinates_for_robot(self, results, output_file, coordinate_system='euler_xyz'):
-        """
-        Save brick coordinates in a robot-friendly format
-        
-        Args:
-            results: Results from cluster_and_save_summary()
-            output_file: Path to save robot coordinates file
-            coordinate_system: Coordinate system for rotations
-        """
-        robot_coords_file = output_file.replace('.txt', '_robot_coordinates.txt')
-        
-        with open(robot_coords_file, 'w') as f:
-            f.write("# LEGO Brick Coordinates for Robot Arm\n")
-            f.write("# Format: brick_id x(m) y(m) z(m) rx(deg) ry(deg) rz(deg) confidence\n")
-            f.write("# Coordinate system: camera frame\n")
-            f.write("# Note: Apply camera-to-robot transformation for robot coordinates\n")
-            f.write("\n")
+        if coordinates is None:
+            print("No coordinates to save")
+            return
             
-            brick_count = 0
-            for result in results:
-                if 'brick_position' in result and 'brick_rotation' in result:
-                    brick_count += 1
-                    
-                    # Extract coordinates
-                    x, y, z = result['brick_position']
-                    rx, ry, rz = result['brick_rotation']
-                    
-                    # Calculate confidence based on match score
-                    confidence = result.get('match_score', 0.0)
-                    
-                    # Write robot-friendly format
-                    f.write(f"BRICK_{brick_count:03d} {x:.6f} {y:.6f} {z:.6f} {rx:.2f} {ry:.2f} {rz:.2f} {confidence:.3f}\n")
-                    
-                    # Additional information for debugging
-                    f.write(f"# Template_ID: {result.get('template_id', 'N/A')}\n")
-                    f.write(f"# Method: {result.get('method', 'N/A')}\n")
-                    f.write("\n")
+        # Create timestamp for unique filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename_with_timestamp = f"{output_file}_{timestamp}.txt"
         
-        print(f"Saved robot coordinates: {robot_coords_file}")
-        print(f"Found {brick_count} bricks with pose information")
+        # Prepare coordinate data for saving
+        position = coordinates['position']
         
-        return robot_coords_file
+        # Save coordinates in a simple format for robot arm
+        with open(filename_with_timestamp, 'w') as f:
+            f.write("=== LEGO Brick Detection Results ===\n")
+            f.write(f"Detection Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Coordinate System: World Coordinates\n\n")
+            
+            f.write("=== Brick Position (World Coordinates) ===\n")
+            f.write(f"X: {position[0]:.6f} meters\n")
+            f.write(f"Y: {position[1]:.6f} meters\n") 
+            f.write(f"Z: {position[2]:.6f} meters\n\n")
+            
+            if 'rotation' in coordinates:
+                rotation = coordinates['rotation']
+                f.write("=== Brick Orientation ===\n")
+                if coordinates.get('coordinate_system') == 'quaternion':
+                    f.write(f"Quaternion X: {rotation[0]:.6f}\n")
+                    f.write(f"Quaternion Y: {rotation[1]:.6f}\n") 
+                    f.write(f"Quaternion Z: {rotation[2]:.6f}\n")
+                    f.write(f"Quaternion W: {coordinates.get('qw', 0):.6f}\n")
+                else:
+                    f.write(f"Rotation X: {rotation[0]:.3f} degrees\n")
+                    f.write(f"Rotation Y: {rotation[1]:.3f} degrees\n")
+                    f.write(f"Rotation Z: {rotation[2]:.3f} degrees\n")
+            
+            f.write("\n=== Ready for Robot Arm Grasping ===\n")
+            f.write("Position format: [X, Y, Z] in meters from world origin\n")
+            
+        print(f"Brick coordinates saved to: {filename_with_timestamp}")
+        return filename_with_timestamp
 
     # ========== TEMPLATE LIBRARY GENERATION METHODS ==========
     
@@ -1526,7 +1483,7 @@ class BinPickingSystem:
 
     def find_best_template_match(self, target_points, template_library_dir, 
                                 correlation_threshold=0.7,
-                                max_templates_to_test=50):
+                                max_templates_to_test=700):
         """
         Find best matching template from library using spin image matching
         """
@@ -1912,9 +1869,24 @@ class BinPickingSystem:
         
         print(f"Saved enhanced analysis summary: {summary_file}")
         
-        # Save robot-friendly coordinates if pose estimation was successful
+        # Save world coordinates if pose estimation was successful
         if any('brick_position' in result for result in results):
-            self.save_brick_coordinates_for_robot(results, summary_file)
+            # Extract coordinates from the best result for simplified saving
+            best_result = None
+            for result in results:
+                if 'brick_position' in result and 'brick_rotation' in result:
+                    best_result = result
+                    break
+            
+            if best_result:
+                # Create simplified coordinates dictionary for world coordinate saving
+                coordinates = {
+                    'position': best_result['brick_position'],
+                    'rotation': best_result['brick_rotation'],
+                    'coordinate_system': 'euler_xyz'
+                }
+                coord_file = summary_file.replace('.txt', '_world_coordinates')
+                self.save_brick_coordinates(coordinates, coord_file)
         
         # Save detailed pose information if available
         if any('method' in result for result in results):
@@ -2007,9 +1979,8 @@ if __name__ == "__main__":
     # Initialize the bin picking system
     system = BinPickingSystem(wdf_path="")
     
-    # Example 1: Generate LEGO brick template library from CAD model
-    # Uncomment and modify the path to your LEGO CAD file
-    # cad_file = "path/to/your/lego_brick.ply"  # or .stl, .obj
+    # Generate LEGO brick template library from CAD model
+    # cad_file = "C:\\Users\\FILAB\\Desktop\\DUY\\LegoBrick_4_2.stl"  # or .stl, .obj
     # template_output_dir = "templates/lego_brick"
     # success = system.generate_lego_templates(cad_file, template_output_dir)
     # if success:
