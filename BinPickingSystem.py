@@ -978,34 +978,60 @@ class BinPickingSystem:
     def generate_depth_image_from_viewpoint(self, mesh, x_angle, y_angle, image_size=512, depth_scale=1000):
         """
         Generate depth image from specific viewpoint (x_angle, y_angle)
+        Similar to 3D_bin_picking.py but with read-only mesh fix
         x_angle: rotation around x-axis (0-180 degrees)
         y_angle: rotation around y-axis (0-360 degrees)
         """
-        # Create rotation matrices
-        rx = np.radians(x_angle)
-        ry = np.radians(y_angle)
+        try:
+            # Create rotation matrices (similar to 3D_bin_picking.py approach)
+            rx = np.radians(x_angle)
+            ry = np.radians(y_angle)
+            
+            Rx = np.array([
+                [1, 0, 0],
+                [0, np.cos(rx), -np.sin(rx)],
+                [0, np.sin(rx), np.cos(rx)]
+            ])
+            
+            Ry = np.array([
+                [np.cos(ry), 0, np.sin(ry)],
+                [0, 1, 0],
+                [-np.sin(ry), 0, np.cos(ry)]
+            ])
+            
+            # Combined rotation matrix (Y first, then X - same as 3D_bin_picking.py)
+            R_combined = Ry @ Rx
+            
+            # Apply rotation to mesh - Fixed approach to avoid read-only issues
+            # Create a new mesh with manually rotated vertices instead of using mesh.rotate()
+            original_vertices = np.asarray(mesh.vertices)
+            original_triangles = np.asarray(mesh.triangles)
+            
+            # Check if we have valid mesh data
+            if len(original_vertices) == 0:
+                print(f"Warning: Empty mesh for viewpoint ({x_angle}, {y_angle})")
+                return np.zeros((image_size, image_size))
+            
+            # Manually rotate vertices to avoid Open3D read-only buffer issues
+            rotated_vertices = (R_combined @ original_vertices.T).T
+            
+            # Create new mesh with rotated vertices
+            mesh_rotated = o3d.geometry.TriangleMesh()
+            mesh_rotated.vertices = o3d.utility.Vector3dVector(rotated_vertices)
+            mesh_rotated.triangles = o3d.utility.Vector3iVector(original_triangles)
+            
+        except Exception as e:
+            print(f"Error during mesh rotation for viewpoint ({x_angle}, {y_angle}): {e}")
+            return np.zeros((image_size, image_size))
         
-        Rx = np.array([
-            [1, 0, 0],
-            [0, np.cos(rx), -np.sin(rx)],
-            [0, np.sin(rx), np.cos(rx)]
-        ])
+        # Compute normals for the rotated mesh
+        try:
+            mesh_rotated.compute_vertex_normals()
+            mesh_rotated.compute_triangle_normals()
+        except Exception as e:
+            print(f"Warning: Could not compute normals for viewpoint ({x_angle}, {y_angle}): {e}")
         
-        Ry = np.array([
-            [np.cos(ry), 0, np.sin(ry)],
-            [0, 1, 0],
-            [-np.sin(ry), 0, np.cos(ry)]
-        ])
-        
-        # Combined rotation matrix
-        R_combined = Ry @ Rx
-        
-        # Apply rotation to mesh
-        # Create a copy of the mesh using deepcopy to avoid Open3D version issues
-        mesh_rotated = copy.deepcopy(mesh)
-        mesh_rotated.rotate(R_combined, center=(0, 0, 0))
-        
-        # Create virtual camera setup
+        # Create virtual camera setup - similar to 3D_bin_picking.py approach
         # Position camera at distance to view the entire object
         bounds = mesh_rotated.get_axis_aligned_bounding_box()
         max_extent = np.max(bounds.get_extent())
@@ -1017,43 +1043,48 @@ class BinPickingSystem:
         camera_up = np.array([0, 1, 0])
         
         # Create visualization for depth rendering
-        vis = o3d.visualization.Visualizer()
-        vis.create_window(visible=False, width=image_size, height=image_size)
-        vis.add_geometry(mesh_rotated)
-        
-        # Set camera parameters
-        ctr = vis.get_view_control()
-        camera_params = ctr.convert_to_pinhole_camera_parameters()
-        
-        # Set extrinsic parameters (camera pose)
-        camera_params.extrinsic = np.eye(4)
-        camera_params.extrinsic[:3, :3] = np.eye(3)  # Identity rotation (camera looks along -Z)
-        camera_params.extrinsic[:3, 3] = camera_position
-        
-        # Set intrinsic parameters
-        focal_length = image_size * 0.8  # Approximate focal length
-        camera_params.intrinsic.set_intrinsics(
-            image_size, image_size, focal_length, focal_length, 
-            image_size/2, image_size/2
-        )
-        
-        ctr.convert_from_pinhole_camera_parameters(camera_params)
-        
-        # Render and capture depth
-        vis.poll_events()
-        vis.update_renderer()
-        
-        depth_image = vis.capture_depth_float_buffer(do_render=True)
-        vis.destroy_window()
-        
-        # Convert depth buffer to numpy array and process
-        depth_array = np.asarray(depth_image)
-        
-        # Convert to meaningful depth values and handle invalid depths
-        depth_array[depth_array == 1.0] = 0  # Set invalid depths to 0
-        depth_array = depth_array * depth_scale  # Scale to millimeters
-        
-        return depth_array
+        try:
+            vis = o3d.visualization.Visualizer()
+            vis.create_window(visible=False, width=image_size, height=image_size)
+            vis.add_geometry(mesh_rotated)
+            
+            # Set camera parameters
+            ctr = vis.get_view_control()
+            camera_params = ctr.convert_to_pinhole_camera_parameters()
+            
+            # Set extrinsic parameters (camera pose)
+            camera_params.extrinsic = np.eye(4)
+            camera_params.extrinsic[:3, :3] = np.eye(3)  # Identity rotation (camera looks along -Z)
+            camera_params.extrinsic[:3, 3] = camera_position
+            
+            # Set intrinsic parameters
+            focal_length = image_size * 0.8  # Approximate focal length
+            camera_params.intrinsic.set_intrinsics(
+                image_size, image_size, focal_length, focal_length, 
+                image_size/2, image_size/2
+            )
+            
+            ctr.convert_from_pinhole_camera_parameters(camera_params)
+            
+            # Render and capture depth
+            vis.poll_events()
+            vis.update_renderer()
+            
+            depth_image = vis.capture_depth_float_buffer(do_render=True)
+            vis.destroy_window()
+            
+            # Convert depth buffer to numpy array and process
+            depth_array = np.asarray(depth_image)
+            
+            # Convert to meaningful depth values and handle invalid depths
+            depth_array[depth_array == 1.0] = 0  # Set invalid depths to 0
+            depth_array = depth_array * depth_scale  # Scale to millimeters
+            
+            return depth_array
+            
+        except Exception as e:
+            print(f"Error during depth rendering for viewpoint ({x_angle}, {y_angle}): {e}")
+            return np.zeros((image_size, image_size))
 
     def depth_image_to_point_cloud(self, depth_image, x_angle, y_angle, focal_length=None):
         """Convert depth image back to 3D point cloud"""
@@ -1510,25 +1541,28 @@ class BinPickingSystem:
 
     def generate_and_save_template_database(self, stl_file_path, output_path, 
                                           x_step=30, y_step=30, 
-                                          num_corners_per_view=10):
+                                          num_corners_per_view=10,
+                                          save_as_folder=True):
         """
         STEP 1: Generate template database from CAD model and save it
         This should be run ONCE per brick type to create the template database
         
         Args:
             stl_file_path: Path to STL CAD model file
-            output_path: Path to save the template database (e.g., "lego_brick_templates.pkl")
+            output_path: Path to save the template database (folder or .pkl file)
             x_step: Step size for x-axis rotation (degrees) - smaller = more templates, better accuracy
             y_step: Step size for y-axis rotation (degrees) - smaller = more templates, better accuracy
             num_corners_per_view: Number of Harris corners to extract per viewpoint
+            save_as_folder: If True, save as organized folder structure; if False, save as single .pkl file
         
         Returns:
-            template_database: The generated database (also saved to file)
+            template_database: The generated database (also saved to folder/file)
         """
         print("=== GENERATING TEMPLATE DATABASE FROM CAD MODEL ===")
         print(f"Input STL file: {stl_file_path}")
-        print(f"Output database file: {output_path}")
+        print(f"Output path: {output_path}")
         print(f"Template resolution: x_step={x_step}°, y_step={y_step}°")
+        print(f"Save format: {'Folder structure' if save_as_folder else 'Single pickle file'}")
         
         # Generate comprehensive template database
         template_database = self.generate_cad_template_database(
@@ -1542,13 +1576,18 @@ class BinPickingSystem:
             print("Failed to generate template database")
             return None
         
-        # Save template database to file
+        # Save template database
         try:
-            with open(output_path, "wb") as f:
-                pickle.dump(template_database, f)
-            print(f"Template database saved successfully to: {output_path}")
+            if save_as_folder:
+                self.save_template_database_as_folder(template_database, output_path)
+            else:
+                # Save as single pickle file (original method)
+                with open(output_path, "wb") as f:
+                    pickle.dump(template_database, f)
+                print(f"Template database saved successfully to: {output_path}")
+            
             print(f"Database contains {template_database['metadata']['total_views']} templates")
-            print("You can now use this database file in the main bin picking pipeline")
+            print("You can now use this database in the main bin picking pipeline")
             
         except Exception as e:
             print(f"Error saving template database: {e}")
@@ -1556,30 +1595,219 @@ class BinPickingSystem:
         
         return template_database
 
+    def save_template_database_as_folder(self, template_database, folder_path):
+        """
+        Save template database as organized folder structure
+        
+        Folder structure:
+        template_folder/
+        ├── metadata.json
+        ├── templates/
+        │   ├── template_000_x000_y000/
+        │   │   ├── points.npy
+        │   │   ├── harris_corners.npy
+        │   │   ├── spin_images.npy
+        │   │   └── info.json
+        │   ├── template_001_x000_y030/
+        │   └── ...
+        └── index.json
+        """
+        import json
+        
+        print(f"=== SAVING TEMPLATE DATABASE AS FOLDER STRUCTURE ===")
+        print(f"Output folder: {folder_path}")
+        
+        # Create main folder
+        os.makedirs(folder_path, exist_ok=True)
+        
+        # Create templates subfolder
+        templates_folder = os.path.join(folder_path, "templates")
+        os.makedirs(templates_folder, exist_ok=True)
+        
+        # Save metadata
+        metadata_path = os.path.join(folder_path, "metadata.json")
+        with open(metadata_path, 'w') as f:
+            json.dump(template_database['metadata'], f, indent=2)
+        
+        # Save index of all templates
+        template_index = []
+        
+        # Save individual templates
+        for i, template in enumerate(template_database['templates']):
+            # Create folder name: template_XXX_xAAA_yBBB
+            x_angle, y_angle = template['viewpoint']
+            template_folder_name = f"template_{i:03d}_x{x_angle:03d}_y{y_angle:03d}"
+            template_folder_path = os.path.join(templates_folder, template_folder_name)
+            os.makedirs(template_folder_path, exist_ok=True)
+            
+            # Save template data
+            # Points as numpy array
+            points_path = os.path.join(template_folder_path, "points.npy")
+            np.save(points_path, template['points'])
+            
+            # Harris corners
+            corners_path = os.path.join(template_folder_path, "harris_corners.npy")
+            np.save(corners_path, template['harris_corners'])
+            
+            # Spin images
+            spin_images_path = os.path.join(template_folder_path, "spin_images.npy")
+            np.save(spin_images_path, np.array(template['spin_images']))
+            
+            # Template info as JSON
+            template_info = {
+                'viewpoint': template['viewpoint'],
+                'point_count': template['point_count'],
+                'corner_count': template['corner_count'],
+                'template_id': i
+            }
+            info_path = os.path.join(template_folder_path, "info.json")
+            with open(info_path, 'w') as f:
+                json.dump(template_info, f, indent=2)
+            
+            # Add to index
+            template_index.append({
+                'template_id': i,
+                'folder_name': template_folder_name,
+                'viewpoint': template['viewpoint'],
+                'point_count': template['point_count'],
+                'corner_count': template['corner_count']
+            })
+            
+            print(f"Saved template {i:03d}: viewpoint ({x_angle}°, {y_angle}°)")
+        
+        # Save template index
+        index_path = os.path.join(folder_path, "index.json")
+        with open(index_path, 'w') as f:
+            json.dump(template_index, f, indent=2)
+        
+        print(f"=== TEMPLATE FOLDER STRUCTURE COMPLETED ===")
+        print(f"Saved {len(template_database['templates'])} templates to: {folder_path}")
+        print(f"Structure: {len(template_database['templates'])} template folders + metadata + index")
+
     def load_template_database(self, database_path):
         """
-        Load a pre-generated template database from file
+        Load a pre-generated template database from file OR folder
+        Automatically detects whether it's a .pkl file or folder structure
         
         Args:
-            database_path: Path to the saved template database file
+            database_path: Path to the saved template database (file or folder)
             
         Returns:
             template_database: The loaded template database
         """
         try:
-            with open(database_path, "rb") as f:
-                template_database = pickle.load(f)
-            
-            print(f"Template database loaded successfully from: {database_path}")
-            print(f"Database contains {len(template_database['templates'])} templates")
-            print(f"Source CAD file: {template_database['metadata']['source_file']}")
-            print(f"Template resolution: {template_database['metadata']['x_step']}° x {template_database['metadata']['y_step']}°")
-            
-            return template_database
+            # Check if it's a file or folder
+            if os.path.isfile(database_path):
+                # Load from pickle file (original method)
+                return self.load_template_database_from_file(database_path)
+            elif os.path.isdir(database_path):
+                # Load from folder structure (new method)
+                return self.load_template_database_from_folder(database_path)
+            else:
+                print(f"Error: Database path does not exist: {database_path}")
+                return None
             
         except Exception as e:
             print(f"Error loading template database from {database_path}: {e}")
             return None
+
+    def load_template_database_from_file(self, file_path):
+        """
+        Load template database from pickle file (original method)
+        """
+        with open(file_path, "rb") as f:
+            template_database = pickle.load(f)
+        
+        print(f"Template database loaded successfully from file: {file_path}")
+        print(f"Database contains {len(template_database['templates'])} templates")
+        print(f"Source CAD file: {template_database['metadata']['source_file']}")
+        print(f"Template resolution: {template_database['metadata']['x_step']}° x {template_database['metadata']['y_step']}°")
+        
+        return template_database
+
+    def load_template_database_from_folder(self, folder_path):
+        """
+        Load template database from folder structure
+        """
+        import json
+        
+        print(f"=== LOADING TEMPLATE DATABASE FROM FOLDER ===")
+        print(f"Folder path: {folder_path}")
+        
+        # Load metadata
+        metadata_path = os.path.join(folder_path, "metadata.json")
+        if not os.path.exists(metadata_path):
+            raise ValueError(f"Metadata file not found: {metadata_path}")
+        
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+        
+        # Load template index
+        index_path = os.path.join(folder_path, "index.json")
+        if not os.path.exists(index_path):
+            raise ValueError(f"Index file not found: {index_path}")
+        
+        with open(index_path, 'r') as f:
+            template_index = json.load(f)
+        
+        # Initialize template database structure
+        template_database = {
+            'templates': [],
+            'viewpoints': [],
+            'harris_corners': [],
+            'spin_images': [],
+            'metadata': metadata
+        }
+        
+        # Load individual templates
+        templates_folder = os.path.join(folder_path, "templates")
+        
+        for template_info in template_index:
+            template_folder_name = template_info['folder_name']
+            template_folder_path = os.path.join(templates_folder, template_folder_name)
+            
+            if not os.path.exists(template_folder_path):
+                print(f"Warning: Template folder not found: {template_folder_path}")
+                continue
+            
+            try:
+                # Load template data
+                points = np.load(os.path.join(template_folder_path, "points.npy"))
+                harris_corners = np.load(os.path.join(template_folder_path, "harris_corners.npy"))
+                spin_images = np.load(os.path.join(template_folder_path, "spin_images.npy"))
+                
+                # Load template info
+                with open(os.path.join(template_folder_path, "info.json"), 'r') as f:
+                    info = json.load(f)
+                
+                # Create template data structure
+                template_data = {
+                    'viewpoint': tuple(info['viewpoint']),
+                    'points': points,
+                    'harris_corners': harris_corners,
+                    'spin_images': spin_images.tolist(),  # Convert back to list
+                    'point_count': info['point_count'],
+                    'corner_count': info['corner_count']
+                }
+                
+                # Add to database
+                template_database['templates'].append(template_data)
+                template_database['viewpoints'].append(tuple(info['viewpoint']))
+                template_database['harris_corners'].append(harris_corners)
+                template_database['spin_images'].append(spin_images.tolist())
+                
+                print(f"Loaded template {info['template_id']:03d}: viewpoint {info['viewpoint']}")
+                
+            except Exception as e:
+                print(f"Error loading template from {template_folder_path}: {e}")
+                continue
+        
+        print(f"=== TEMPLATE DATABASE LOADED ===")
+        print(f"Successfully loaded {len(template_database['templates'])} templates")
+        print(f"Source CAD file: {metadata['source_file']}")
+        print(f"Template resolution: {metadata['x_step']}° x {metadata['y_step']}°")
+        
+        return template_database
 
     def run_pipeline_simple(self):
         """
