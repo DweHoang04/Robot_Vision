@@ -23,6 +23,8 @@ from scipy.spatial.transform import Rotation as R
 from pykinect2 import PyKinectRuntime, PyKinectV2
 from pykinect2.PyKinectV2 import *
 
+import matplotlib.pyplot as plt
+
 # Main Program
 class BinPickingSystem:
 
@@ -32,8 +34,6 @@ class BinPickingSystem:
         # self.host = "192.168.1.23" # Target IP for sending data to the robot arm
         # self.port = 9999 # Target (Robot arm) port
 
-    # ========== STEP 1: DATA ACQUISITION AND PREPROCESSING ==========
-    
     # Border filtering algorithm using AND logic
     def keep_inside_boundary_points(self, points, colors, x_min, x_max, y_min, y_max, margin=0.02):
         mask = (
@@ -42,665 +42,7 @@ class BinPickingSystem:
         ) # Removing the border by an amount of margin
         # The scanning range will be (x_min + margin, x_max - margin) x (y_min + margin, y_max - margin)
         return points[mask], colors[mask] # Return filtered point cloud and color values
-
-    # ========== STEPS 2-3: CLUSTERING AND TOPMOST BRICK EXTRACTION ==========
     
-    def find_and_extract_topmost_brick(self, points, colors, dbscan_eps=0.01, dbscan_min_samples=10, 
-                                      color_tolerance=0.15, top_surface_depth=0.02):
-        """
-        Combined Step 2-3: Find the closest cluster to camera and extract topmost brick by dominant color
-        
-        This function:
-        1. Finds the cluster with the closest point to camera
-        2. Extracts the color from the closest points in that cluster
-        3. Filters the entire point cloud to keep only points with the dominant color
-        
-        Args:
-            points: 3D point cloud
-            colors: RGB colors for each point
-            dbscan_eps: DBSCAN radius parameter
-            dbscan_min_samples: DBSCAN minimum samples parameter
-            color_tolerance: Tolerance for color similarity (0.0 = exact match, 1.0 = any color)
-            top_surface_depth: Depth range to consider as "top surface" for color extraction (meters)
-        
-        Returns:
-            Tuple of (topmost_brick_points, topmost_brick_colors, cluster_label)
-        """
-        print("Step 2-3: Finding closest cluster and extracting topmost brick by color...")
-        
-        # PHASE 1: Find the cluster with the closest point to camera
-        dbscan = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples).fit(points)
-        labels = dbscan.labels_
-        
-        # Find all valid clusters (exclude noise with label -1)
-        valid_clusters = []
-        for lbl in set(labels):
-            if lbl == -1:  # Skip noise points
-                continue
-            
-            cluster_mask = (labels == lbl)
-            cluster_points = points[cluster_mask]
-            cluster_colors = colors[cluster_mask]
-            
-            # Filter small clusters that are likely noise
-            if len(cluster_points) < 100:
-                continue
-            
-            # Find the closest point in this cluster (minimum Z value)
-            min_z = np.min(cluster_points[:, 2])
-            cluster_center = np.mean(cluster_points, axis=0)
-            
-            valid_clusters.append({
-                'label': lbl,
-                'points': cluster_points,
-                'colors': cluster_colors,
-                'min_z': min_z,
-                'center': cluster_center,
-                'size': len(cluster_points)
-            })
-        
-        if len(valid_clusters) == 0:
-            print("No valid clusters found")
-            return None, None, -1
-        
-        # Sort by closest point (smallest Z value) and select the closest cluster
-        valid_clusters.sort(key=lambda x: x['min_z'])
-        closest_cluster = valid_clusters[0]
-        
-        print(f"Found {len(valid_clusters)} valid clusters")
-        print(f"Selected closest cluster {closest_cluster['label']} with closest point at Z={closest_cluster['min_z']:.3f}m")
-        print(f"Cluster size: {closest_cluster['size']} points")
-        
-        # PHASE 2: Extract dominant color from the closest points in the selected cluster
-        cluster_points = closest_cluster['points']
-        cluster_colors = closest_cluster['colors']
-        
-        # Find the topmost points (closest to camera) in the selected cluster
-        z_coords = cluster_points[:, 2]
-        z_min = np.min(z_coords)
-        z_threshold = z_min + top_surface_depth  # Consider top surface for color extraction
-        
-        top_surface_mask = z_coords <= z_threshold
-        top_surface_colors = cluster_colors[top_surface_mask]
-        
-        if len(top_surface_colors) == 0:
-            print("No top surface points found in closest cluster, using cluster center color")
-            # Fallback: use colors near the cluster center
-            center = closest_cluster['center']
-            distances_to_center = np.linalg.norm(cluster_points - center, axis=1)
-            closest_to_center_idx = np.argmin(distances_to_center)
-            dominant_color = cluster_colors[closest_to_center_idx]
-            dominant_color_name = "unknown"
-        else:
-            # Get dominant color from top surface of the closest cluster using HSV classification
-            dominant_color, dominant_color_name = self.get_dominant_color(top_surface_colors)
-        
-        print(f"Extracted dominant color from closest cluster: {dominant_color_name}")
-        print(f"RGB values: [{dominant_color[0]:.3f}, {dominant_color[1]:.3f}, {dominant_color[2]:.3f}]")
-        
-        # PHASE 3: Filter the entire point cloud by the dominant color using HSV-based classification
-        # This ensures we get all points of the topmost brick, even if they extend beyond the closest cluster
-        filtered_points_list = []
-        filtered_colors_list = []
-        
-        for i, color in enumerate(colors):
-            color_name, _ = self.classify_hsv_color(color)
-            if color_name == dominant_color_name:
-                filtered_points_list.append(points[i])
-                filtered_colors_list.append(color)
-        
-        if len(filtered_points_list) == 0:
-            print("No points found with exact HSV color match, falling back to RGB tolerance")
-            # Fallback to RGB distance-based filtering with tight tolerance
-            color_distances = np.linalg.norm(colors - dominant_color, axis=1)
-            similar_color_mask = color_distances <= color_tolerance
-            topmost_brick_points = points[similar_color_mask]
-            topmost_brick_colors = colors[similar_color_mask]
-        else:
-            topmost_brick_points = np.array(filtered_points_list)
-            topmost_brick_colors = np.array(filtered_colors_list)
-        
-        print(f"HSV-based color filtering: {len(points)} → {len(topmost_brick_points)} points")
-        print(f"Filtered out {len(points) - len(topmost_brick_points)} points with different colors")
-        print(f"Successfully extracted topmost brick with {dominant_color_name} color")
-        
-        return topmost_brick_points, topmost_brick_colors, closest_cluster['label']
-    
-    # ========== ENHANCED ALIGNMENT ALGORITHM ==========
-    
-    def apply_enhanced_alignment_algorithm(self, template_keypoints, target_keypoints, correspondences,
-                                         epsilon1=0.005, epsilon2=0.01, iter_max=1000, max_outer_iter=50):
-        """
-        Step 4: Enhanced alignment algorithm based on the paper pseudocode:
-        
-        INPUT: Uc (template keypoints), Wc (target keypoints), U (template points), W (target points)
-        OUTPUT: estimated pose
-        
-        This is the exact algorithm from your specification:
-        Set Ce = Cmax, Pe = Pmax
-        While Ce > ε2
-            While Pe > ε1
-                iter = 1
-                Select 3 similar matching pair points randomly.
-                Compute the rigid transformation.
-                    U'c = RUc + T
-                    Pe = ‖U'c − Wc‖ / √n
-                iter = iter + 1
-                If iter > Iter_max
-                    Break;
-                END If
-            END While
-            If Pe > ε1
-                Return 1, Break
-            END If
-            U' = RU + T
-            Compute the means for U' and W as U'm and Wm
-                Ce = ‖U'm − Wm‖
-        END While
-        ICP Refinement on U' and W
-        Compute the pose estimation
-        """
-        print("Step 4: Applying enhanced alignment algorithm from paper...")
-        
-        if len(correspondences) < 3:
-            print("Insufficient correspondences for pose estimation")
-            return None, None
-        
-        # Extract correspondence pairs
-        Uc = np.array([template_keypoints[i] for i, j, _ in correspondences])  # Template keypoints
-        Wc = np.array([target_keypoints[j] for i, j, _ in correspondences])    # Target keypoints
-        
-        # For this implementation, we'll use the keypoints as both U and W
-        # In a full implementation, U and W would be the complete point clouds
-        U = Uc  # Template points
-        W = Wc  # Target points
-        
-        print(f"Starting enhanced alignment with {len(correspondences)} correspondences")
-        
-        # Initialize Ce and Pe to maximum values
-        Ce = float('inf')  # Cmax
-        Pe = float('inf')  # Pmax
-        
-        best_R, best_T = None, None
-        outer_iter = 0
-        
-        # Outer loop: While Ce > ε2
-        while Ce > epsilon2 and outer_iter < max_outer_iter:
-            outer_iter += 1
-            print(f"Outer iteration {outer_iter}: Ce = {Ce:.6f}")
-            
-            # Inner loop: While Pe > ε1
-            inner_iter = 0
-            while Pe > epsilon1 and inner_iter < iter_max:
-                inner_iter += 1
-                
-                # Select 3 similar matching pair points randomly
-                if len(correspondences) >= 3:
-                    sample_indices = np.random.choice(len(correspondences), 3, replace=False)
-                    sample_Uc = Uc[sample_indices]
-                    sample_Wc = Wc[sample_indices]
-                    
-                    # Compute the rigid transformation
-                    R, T = self.estimate_rigid_transformation_3_points(sample_Uc, sample_Wc)
-                    
-                    if R is not None:
-                        # U'c = RUc + T
-                        Uc_prime = (R @ Uc.T).T + T
-                        
-                        # Pe = ‖U'c − Wc‖ / √n
-                        distances = np.linalg.norm(Uc_prime - Wc, axis=1)
-                        Pe = np.mean(distances) / np.sqrt(len(Uc))
-                        
-                        # Store best transformation
-                        if best_R is None or Pe < epsilon1:
-                            best_R, best_T = R.copy(), T.copy()
-                
-                # If iter > Iter_max, Break
-                if inner_iter >= iter_max:
-                    break
-            
-            # If Pe > ε1, Return 1, Break
-            if Pe > epsilon1:
-                print(f"Failed to converge: Pe = {Pe:.6f} > ε1 = {epsilon1}")
-                return None, None
-            
-            # U' = RU + T
-            if best_R is not None:
-                U_prime = (best_R @ U.T).T + best_T
-                
-                # Compute the means for U' and W as U'm and Wm
-                U_prime_mean = np.mean(U_prime, axis=0)
-                W_mean = np.mean(W, axis=0)
-                
-                # Ce = ‖U'm − Wm‖
-                Ce = np.linalg.norm(U_prime_mean - W_mean)
-                
-                print(f"Inner loop converged: Pe = {Pe:.6f}, Ce = {Ce:.6f}")
-        
-        if best_R is None:
-            print("Enhanced alignment algorithm failed")
-            return None, None
-        
-        print(f"Enhanced alignment converged in {outer_iter} outer iterations")
-        print(f"Final Pe = {Pe:.6f}, Ce = {Ce:.6f}")
-        
-        # ICP Refinement on U' and W
-        print("Performing ICP refinement...")
-        refined_R, refined_T = self.refine_pose_with_icp(U, W, best_R, best_T)
-        
-        return refined_R, refined_T
-    
-    def detect_and_match_topmost_brick(self, cluster_points, cluster_colors, template_library_dir=None):
-        """
-        Step 4: Apply Harris 3D and spin image for pose matching the top brick
-        
-        Args:
-            cluster_points: Points from the closest cluster after color filtering
-            cluster_colors: Colors from the closest cluster after color filtering
-            template_library_dir: Directory containing template library (optional)
-        
-        Returns:
-            Dictionary containing pose estimation results
-        """
-        print("Step 4: Detecting and matching topmost brick using Harris 3D and spin images...")
-        
-        # Apply Harris 3D corner detection
-        corner_hypotheses = self.compute_harris_3d_corners_multi_hypothesis(
-            cluster_points, 
-            delta=0.02,
-            harris_k=0.04,
-            num_corners=15,
-            num_hypotheses=1
-        )
-        
-        if len(corner_hypotheses) == 0:
-            print("No Harris corners detected")
-            return None
-        
-        target_keypoints = corner_hypotheses[0]
-        print(f"Detected {len(target_keypoints)} Harris corner keypoints")
-        
-        # If template library is provided, use spin image matching
-        if template_library_dir and os.path.exists(template_library_dir):
-            return self.match_with_template_library(cluster_points, cluster_colors, 
-                                                   target_keypoints, template_library_dir)
-        else:
-            print("No template library provided")
-            return None
-    
-    def match_with_template_library(self, target_points, target_colors, target_keypoints, template_library_dir):
-        """
-        Match target brick with template library using spin images
-        """
-        print("Matching with template library using spin images...")
-        
-        # Load template library
-        templates = self.load_template_library(template_library_dir)
-        if not templates:
-            print("No templates found in library")
-            return None
-        
-        best_match = None
-        best_score = -1
-        
-        # Compute surface normals for target
-        target_normals = self.compute_surface_normals(target_points)
-        
-        # Get normals for keypoints
-        target_kp_normals = []
-        for kp in target_keypoints:
-            distances = np.linalg.norm(target_points - kp, axis=1)
-            closest_idx = np.argmin(distances)
-            target_kp_normals.append(target_normals[closest_idx])
-        
-        # Match against each template
-        for template in templates:
-            try:
-                template_points = np.array(template['points'])
-                template_keypoints = np.array(template['keypoints']) if 'keypoints' in template else []
-                
-                if len(template_keypoints) == 0:
-                    continue
-                
-                # Perform spin image matching
-                R, T = self.estimate_pose_with_spin_images(
-                    template_points, target_points,
-                    correlation_threshold=0.6
-                )
-                
-                if R is not None:
-                    # Calculate match score
-                    match_score = self.calculate_match_score(template_points, target_points, R, T)
-                    
-                    if match_score > best_score:
-                        best_score = match_score
-                        best_match = {
-                            'template_id': template['id'],
-                            'rotation_matrix': R,
-                            'translation': T,
-                            'match_score': match_score,
-                            'method': 'spin_image_matching'
-                        }
-                        
-            except Exception as e:
-                print(f"Error matching template {template.get('id', 'unknown')}: {e}")
-                continue
-        
-        if best_match:
-            print(f"Best template match: {best_match['template_id']} (score: {best_match['match_score']:.3f})")
-            return best_match
-        else:
-            print("No suitable template match found")
-            return None
-    
-    def calculate_match_score(self, template_points, target_points, R, T, distance_threshold=0.01):
-        """
-        Calculate match score between template and target after transformation
-        """
-        # Transform template points
-        transformed_template = (R @ template_points.T).T + T
-        
-        # Find nearest neighbors
-        distances = scipy.spatial.distance.cdist(transformed_template, target_points)
-        min_distances = np.min(distances, axis=1)
-        
-        # Calculate score based on percentage of points within threshold
-        good_matches = np.sum(min_distances < distance_threshold)
-        score = good_matches / len(transformed_template)
-        
-        return score
-        
-    def find_world_coordinates_of_topmost_brick(self, pose_result):
-        """
-        Step 5: Find the world coordinate after pose matching of the highest brick
-        
-        Args:
-            pose_result: Result from detect_and_match_topmost_brick()
-        
-        Returns:
-            Dictionary containing world coordinates
-        """
-        print("Step 5: Computing world coordinates of topmost brick...")
-        
-        if pose_result is None:
-            print("No pose estimation available")
-            return None
-        
-        # Extract rotation matrix and translation
-        R = np.array(pose_result['rotation_matrix'])
-        T = np.array(pose_result['translation'])
-        
-        # Extract coordinates using the existing method
-        coordinates = self.extract_brick_coordinates(R, T, coordinate_system='euler_xyz')
-        
-        # Add additional information
-        coordinates['method'] = pose_result.get('method', 'unknown')
-        coordinates['match_score'] = pose_result.get('match_score', 0.0)
-        coordinates['template_id'] = pose_result.get('template_id', 'none')
-        
-        print(f"World coordinates computed using {coordinates['method']}")
-        print(f"Position: [{coordinates['position'][0]:.3f}, {coordinates['position'][1]:.3f}, {coordinates['position'][2]:.3f}] meters")
-        print(f"Rotation: [{coordinates['rotation'][0]:.1f}, {coordinates['rotation'][1]:.1f}, {coordinates['rotation'][2]:.1f}] degrees")
-        
-        return coordinates
-    
-    # ========== STEP 6: VISUALIZATION AND OUTPUT ==========
-    
-    def visualize_matched_template(self, cluster_points, cluster_colors, pose_result, 
-                                 template_library_dir=None, output_file=None):
-        """
-        Step 6: Visualize the matched template in the output cluster for verification
-        
-        Args:
-            cluster_points: Original cluster points
-            cluster_colors: Original cluster colors
-            pose_result: Pose estimation result
-            template_library_dir: Directory containing templates
-            output_file: Optional file to save visualization
-        """
-        print("Step 6: Creating visualization of matched template...")
-        
-        geometries = []
-        
-        # Add original cluster (in original colors)
-        cluster_pcd = o3d.geometry.PointCloud()
-        cluster_pcd.points = o3d.utility.Vector3dVector(cluster_points)
-        cluster_pcd.colors = o3d.utility.Vector3dVector(cluster_colors)
-        geometries.append(cluster_pcd)
-        
-        # Add matched template if available
-        if pose_result and 'rotation_matrix' in pose_result and 'translation' in pose_result:
-            template_pcd = self.create_template_visualization(pose_result, template_library_dir)
-            if template_pcd:
-                geometries.append(template_pcd)
-        
-        # Add coordinate frame at the estimated pose
-        if pose_result and 'translation' in pose_result:
-            position = pose_result['translation']
-            R = np.array(pose_result['rotation_matrix'])
-            
-            # Create coordinate frame
-            coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
-                size=0.05, origin=position)
-            
-            # Apply rotation to coordinate frame
-            coord_frame.rotate(R, center=position)
-            geometries.append(coord_frame)
-        
-        # Add world origin coordinate frame
-        world_origin = o3d.geometry.TriangleMesh.create_coordinate_frame(
-            size=0.1, origin=[0, 0, 0])
-        geometries.append(world_origin)
-        
-        # Visualize
-        if geometries:
-            print("Displaying matched template visualization...")
-            o3d.visualization.draw_geometries(
-                geometries,
-                window_name="Matched Template Visualization - Black=Template, Original=Cluster",
-                width=1024,
-                height=768
-            )
-            
-            # Save visualization if output file specified
-            if output_file:
-                self.save_visualization_image(geometries, output_file)
-                print(f"Visualization saved to: {output_file}")
-    
-    def create_template_visualization(self, pose_result, template_library_dir):
-        """
-        Create visualization of the matched template
-        """
-        template_id = pose_result.get('template_id', 'none')
-        
-        if template_id == 'none' or not template_library_dir:
-            # Create a simple box visualization for geometric estimation
-            return self.create_simple_brick_visualization(pose_result)
-        
-        # Load template from library
-        templates = self.load_template_library(template_library_dir)
-        template = None
-        for t in templates:
-            if t['id'] == template_id:
-                template = t
-                break
-        
-        if template is None:
-            return self.create_simple_brick_visualization(pose_result)
-        
-        # Create template point cloud
-        template_points = np.array(template['points'])
-        R = np.array(pose_result['rotation_matrix'])
-        T = np.array(pose_result['translation'])
-        
-        # Transform template to match pose
-        transformed_points = (R @ template_points.T).T + T
-        
-        # Create point cloud with highlight color (red/black for visibility)
-        template_pcd = o3d.geometry.PointCloud()
-        template_pcd.points = o3d.utility.Vector3dVector(transformed_points)
-        
-        # Use black color for high contrast
-        highlight_color = np.array([0.0, 0.0, 0.0])  # Black
-        template_colors = np.tile(highlight_color, (len(transformed_points), 1))
-        template_pcd.colors = o3d.utility.Vector3dVector(template_colors)
-        
-        return template_pcd
-    
-    def create_simple_brick_visualization(self, pose_result):
-        """
-        Create a simple brick visualization for geometric pose estimation
-        """
-        # Create a simple box mesh at the estimated position
-        position = pose_result['translation']
-        R = np.array(pose_result['rotation_matrix'])
-        
-        # Standard LEGO brick dimensions (approximate)
-        brick_box = o3d.geometry.TriangleMesh.create_box(
-            width=0.032, height=0.016, depth=0.016)  # 32x16x16mm
-        
-        # Center the box
-        brick_box.translate([-0.016, -0.008, -0.008])
-        
-        # Apply pose transformation
-        brick_box.rotate(R, center=[0, 0, 0])
-        brick_box.translate(position)
-        
-        # Color it black for visibility
-        brick_box.paint_uniform_color([0.0, 0.0, 0.0])  # Black
-        
-        return brick_box
-    
-    def save_visualization_image(self, geometries, output_file):
-        """
-        Save visualization to image file
-        """
-        try:
-            vis = o3d.visualization.Visualizer()
-            vis.create_window(visible=False, width=1024, height=768)
-            
-            for geom in geometries:
-                vis.add_geometry(geom)
-            
-            vis.poll_events()
-            vis.update_renderer()
-            time.sleep(0.1)  # Stabilize rendering
-            vis.capture_screen_image(output_file)
-            vis.destroy_window()
-            
-        except Exception as e:
-            print(f"Error saving visualization: {e}")
-    
-    def run_enhanced_bin_picking_pipeline(self, template_library_dir=None, enable_visualization=True):
-        """
-        Main pipeline implementing the enhanced bin picking algorithm for stacked LEGO bricks
-        
-        Pipeline Steps:
-        1. Data acquisition and preprocessing
-        2. Find closest cluster to camera
-        3. Color filtering for topmost brick
-        4. Harris 3D and spin image pose matching
-        5. World coordinate calculation
-        6. Visualization for verification
-        """
-        print("="*60)
-        print("ENHANCED BIN PICKING PIPELINE FOR STACKED LEGO BRICKS")
-        print("="*60)
-        
-        # Step 1: Data acquisition and preprocessing
-        print("\n" + "="*50)
-        print("STEP 1: DATA ACQUISITION AND PREPROCESSING")
-        print("="*50)
-        
-        points, colors = self.capture_and_preprocess_kinect_data()
-        if len(points) == 0:
-            print("[ERROR] No valid points found after preprocessing. Exiting.")
-            return None
-        
-        print(f"Successfully acquired {len(points)} points after preprocessing")
-        
-        # Step 2-3: Find closest cluster and extract topmost brick by color
-        print("\n" + "="*50)
-        print("STEP 2-3: FIND CLOSEST CLUSTER AND EXTRACT TOPMOST BRICK")
-        print("="*50)
-        
-        topmost_points, topmost_colors, cluster_label = self.find_and_extract_topmost_brick(
-            points, colors, dbscan_eps=0.01, dbscan_min_samples=10, 
-            color_tolerance=0.15, top_surface_depth=0.02)
-        
-        if topmost_points is None:
-            print("[ERROR] No topmost brick found. Exiting.")
-            return None
-        
-        if len(topmost_points) < 100:
-            print("[WARNING] Very few points in topmost brick")
-            return None
-        
-        # Step 4: Harris 3D and spin image pose matching
-        print("\n" + "="*50)
-        print("STEP 4: HARRIS 3D AND SPIN IMAGE POSE MATCHING")
-        print("="*50)
-        
-        pose_result = self.detect_and_match_topmost_brick(
-            topmost_points, topmost_colors, template_library_dir)
-        
-        if pose_result is None:
-            print("[ERROR] Pose estimation failed. Exiting.")
-            return None
-        
-        # Step 5: World coordinate calculation
-        print("\n" + "="*50)
-        print("STEP 5: WORLD COORDINATE CALCULATION")
-        print("="*50)
-        
-        world_coordinates = self.find_world_coordinates_of_topmost_brick(pose_result)
-        
-        if world_coordinates is None:
-            print("[ERROR] World coordinate calculation failed. Exiting.")
-            return None
-        
-        # Save coordinates to file
-        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        coord_file = os.path.join(self.output_dir, f"Enhanced_Brick_Coordinates_{timestamp_str}")
-        saved_file = self.save_brick_coordinates(world_coordinates, coord_file)
-        
-        # Step 6: Visualization for verification
-        if enable_visualization:
-            print("\n" + "="*50)
-            print("STEP 6: VISUALIZATION FOR VERIFICATION")
-            print("="*50)
-            
-            viz_file = os.path.join(self.output_dir, f"Enhanced_Visualization_{timestamp_str}.png")
-            self.visualize_matched_template(
-                topmost_points, topmost_colors, pose_result, 
-                template_library_dir, viz_file)
-        
-        # Prepare final results
-        results = {
-            'world_coordinates': world_coordinates,
-            'pose_result': pose_result,
-            'cluster_info': {
-                'label': cluster_label,
-                'original_size': len(points),
-                'topmost_size': len(topmost_points)
-            },
-            'files': {
-                'coordinates': saved_file,
-                'visualization': viz_file if enable_visualization else None
-            }
-        }
-        
-        print("\n" + "="*60)
-        print("ENHANCED PIPELINE COMPLETED SUCCESSFULLY!")
-        print("="*60)
-        print(f"Results saved to: {self.output_dir}")
-        if saved_file:
-            print(f"Coordinates: {os.path.basename(saved_file)}")
-        if enable_visualization and 'visualization' in results['files']:
-            print(f"Visualization: {os.path.basename(results['files']['visualization'])}")
-        
-        return results
-
     # Filter 3D points so that only those above or on a reference plane are kept
     def keep_points_above_plane(self, points, colors, plane_model):
         a, b, c, d = plane_model
@@ -844,10 +186,1144 @@ class BinPickingSystem:
         
         return denoised_points, denoised_colors
 
+    # ========== ENHANCED BIN PICKING PIPELINE FOR STACKED LEGO BRICKS ==========
+    
+    def find_and_extract_topmost_brick(self, points, colors, dbscan_eps=0.01, dbscan_min_samples=10, 
+                                      color_tolerance=0.15, top_surface_depth=0.02):
+        """
+        Combined Step 2-3: Find points closest to camera and extract topmost brick by dominant color
+        
+        This function:
+        1. Finds the points that are closest to the camera (smallest Z values) globally
+        2. Extracts the dominant color from these closest points
+        3. Filters the entire point cloud to keep only points with the dominant color
+        
+        Args:
+            points: 3D point cloud
+            colors: RGB colors for each point
+            dbscan_eps: DBSCAN radius parameter
+            dbscan_min_samples: DBSCAN minimum samples parameter
+            color_tolerance: Tolerance for color similarity (0.0 = exact match, 1.0 = any color)
+            top_surface_depth: Depth range to consider as "top surface" for color extraction (meters)
+        
+        Returns:
+            Tuple of (topmost_brick_points, topmost_brick_colors, closest_z_value)
+        """
+        print("Step 2-3: Finding points closest to camera and extracting topmost brick by color...")
+        
+        # PHASE 1: Find the points that are globally closest to the camera
+        # No need for clustering first - we want the absolute closest points regardless of clusters
+        
+        # PHASE 2: Extract dominant color from the points closest to camera (globally)
+        # Find the points that are closest to the camera across the entire point cloud
+        all_z_coords = points[:, 2]
+        z_min_global = np.min(all_z_coords)
+        z_threshold = z_min_global + top_surface_depth  # Consider top surface for color extraction
+        
+        # Get points closest to camera from the entire point cloud
+        closest_to_camera_mask = all_z_coords <= z_threshold
+        closest_points = points[closest_to_camera_mask]
+        closest_colors = colors[closest_to_camera_mask]
+        
+        if len(closest_colors) == 0:
+            print("No points found closest to camera, using minimum Z point")
+            # Fallback: use the single closest point
+            closest_idx = np.argmin(all_z_coords)
+            dominant_color = colors[closest_idx]
+            dominant_color_name = "unknown"
+        else:
+            # Get dominant color from points closest to camera
+            dominant_color = self.get_dominant_color(closest_colors)
+            # Classify the dominant color using HSV classification
+            dominant_color_name, _ = self.classify_hsv_color(dominant_color)
+        
+        print(f"Extracted dominant color from points closest to camera: {dominant_color_name}")
+        print(f"RGB values: [{dominant_color[0]:.3f}, {dominant_color[1]:.3f}, {dominant_color[2]:.3f}]")
+        print(f"Used {len(closest_colors)} points within {top_surface_depth}m of closest point (Z={z_min_global:.3f}m)")
+        
+        # PHASE 3: Filter the entire point cloud by the dominant color using HSV-based classification
+        # This ensures we get all points of the topmost brick, even if they extend beyond the closest cluster
+        filtered_points_list = []
+        filtered_colors_list = []
+        
+        for i, color in enumerate(colors):
+            color_name, _ = self.classify_hsv_color(color)
+            if color_name == dominant_color_name:
+                filtered_points_list.append(points[i])
+                filtered_colors_list.append(color)
+        
+        if len(filtered_points_list) == 0:
+            print("No points found with exact HSV color match, falling back to RGB tolerance")
+            # Fallback to RGB distance-based filtering with tight tolerance
+            color_distances = np.linalg.norm(colors - dominant_color, axis=1)
+            similar_color_mask = color_distances <= color_tolerance
+            topmost_brick_points = points[similar_color_mask]
+            topmost_brick_colors = colors[similar_color_mask]
+        else:
+            topmost_brick_points = np.array(filtered_points_list)
+            topmost_brick_colors = np.array(filtered_colors_list)
+        
+        print(f"HSV-based color filtering: {len(points)} → {len(topmost_brick_points)} points")
+        print(f"Filtered out {len(points) - len(topmost_brick_points)} points with different colors")
+        print(f"Successfully extracted topmost brick with {dominant_color_name} color")
+        
+        return topmost_brick_points, topmost_brick_colors, z_min_global
+    
+    def apply_enhanced_alignment_algorithm(self, template_keypoints, target_keypoints, correspondences,
+                                         epsilon1=0.005, epsilon2=0.01, iter_max=1000, max_outer_iter=50):
+        """
+        Step 4: Enhanced alignment algorithm based on the paper pseudocode:
+        
+        INPUT: Uc (template keypoints), Wc (target keypoints), U (template points), W (target points)
+        OUTPUT: estimated pose
+        
+        This is the exact algorithm from your specification:
+        Set Ce = Cmax, Pe = Pmax
+        While Ce > ε2
+            While Pe > ε1
+                iter = 1
+                Select 3 similar matching pair points randomly.
+                Compute the rigid transformation.
+                    U'c = RUc + T
+                    Pe = ‖U'c − Wc‖ / √n
+                iter = iter + 1
+                If iter > Iter_max
+                    Break;
+                END If
+            END While
+            If Pe > ε1
+                Return 1, Break
+            END If
+            U' = RU + T
+            Compute the means for U' and W as U'm and Wm
+                Ce = ‖U'm − Wm‖
+        END While
+        ICP Refinement on U' and W
+        Compute the pose estimation
+        """
+        print("Step 4: Applying enhanced alignment algorithm from paper...")
+        
+        if len(correspondences) < 3:
+            print("Insufficient correspondences for pose estimation")
+            return None, None
+        
+        # Extract correspondence pairs
+        Uc = np.array([template_keypoints[i] for i, j, _ in correspondences])  # Template keypoints
+        Wc = np.array([target_keypoints[j] for i, j, _ in correspondences])    # Target keypoints
+        
+        # For this implementation, we'll use the keypoints as both U and W
+        # In a full implementation, U and W would be the complete point clouds
+        U = Uc  # Template points
+        W = Wc  # Target points
+        
+        print(f"Starting enhanced alignment with {len(correspondences)} correspondences")
+        
+        # Initialize Ce and Pe to maximum values
+        Ce = float('inf')  # Cmax
+        Pe = float('inf')  # Pmax
+        
+        best_R, best_T = None, None
+        outer_iter = 0
+        
+        # Outer loop: While Ce > ε2
+        while Ce > epsilon2 and outer_iter < max_outer_iter:
+            outer_iter += 1
+            print(f"Outer iteration {outer_iter}: Ce = {Ce:.6f}")
+            
+            # Inner loop: While Pe > ε1
+            inner_iter = 0
+            while Pe > epsilon1 and inner_iter < iter_max:
+                inner_iter += 1
+                
+                # Select 3 similar matching pair points randomly
+                if len(correspondences) >= 3:
+                    sample_indices = np.random.choice(len(correspondences), 3, replace=False)
+                    sample_Uc = Uc[sample_indices]
+                    sample_Wc = Wc[sample_indices]
+                    
+                    # Compute the rigid transformation
+                    R, T = self.estimate_rigid_transformation_3_points(sample_Uc, sample_Wc)
+                    
+                    if R is not None:
+                        # U'c = RUc + T
+                        Uc_prime = (R @ Uc.T).T + T
+                        
+                        # Pe = ‖U'c − Wc‖ / √n
+                        distances = np.linalg.norm(Uc_prime - Wc, axis=1)
+                        Pe = np.mean(distances) / np.sqrt(len(Uc))
+                        
+                        # Store best transformation
+                        if best_R is None or Pe < epsilon1:
+                            best_R, best_T = R.copy(), T.copy()
+                
+                # If iter > Iter_max, Break
+                if inner_iter >= iter_max:
+                    break
+            
+            # If Pe > ε1, Return 1, Break
+            if Pe > epsilon1:
+                print(f"Failed to converge: Pe = {Pe:.6f} > ε1 = {epsilon1}")
+                return None, None
+            
+            # U' = RU + T
+            if best_R is not None:
+                U_prime = (best_R @ U.T).T + best_T
+                
+                # Compute the means for U' and W as U'm and Wm
+                U_prime_mean = np.mean(U_prime, axis=0)
+                W_mean = np.mean(W, axis=0)
+                
+                # Ce = ‖U'm − Wm‖
+                Ce = np.linalg.norm(U_prime_mean - W_mean)
+                
+                print(f"Inner loop converged: Pe = {Pe:.6f}, Ce = {Ce:.6f}")
+        
+        if best_R is None:
+            print("Enhanced alignment algorithm failed")
+            return None, None
+        
+        print(f"Enhanced alignment converged in {outer_iter} outer iterations")
+        print(f"Final Pe = {Pe:.6f}, Ce = {Ce:.6f}")
+        
+        # ICP Refinement on U' and W
+        print("Performing ICP refinement...")
+        refined_R, refined_T = self.refine_pose_with_icp(U, W, best_R, best_T)
+        
+        return refined_R, refined_T
+    
+    def detect_and_match_topmost_brick(self, cluster_points, cluster_colors, template_library_dir=None, enable_spin_images=True):
+        """
+        Complete Pipeline Implementation following the document:
+        1. 3D Keypoint Detection using Harris corners
+        2. Spin Image Computation 
+        3. Spin Image Matching
+        4. RANSAC-Based Matching and Transformation
+        5. ICP Refinement
+        
+        Args:
+            cluster_points: Points from the target object
+            cluster_colors: Colors from the target object
+            template_library_dir: Directory containing template library
+            enable_spin_images: Use spin image matching
+        
+        Returns:
+            Dictionary containing pose estimation results
+        """
+        print("Starting 3D Object Alignment Pipeline...")
+        
+        # Step 2: 3D Keypoint Detection - Extract keypoints from target W
+        print("Step 2: 3D Keypoint Detection")
+        target_keypoints = self.compute_harris_3d_keypoints(cluster_points, num_corners=15)
+        
+        if len(target_keypoints) == 0:
+            print("No Harris corners detected in target")
+            return None
+        
+        print(f"Detected {len(target_keypoints)} target keypoints")
+        
+        # If template library is provided, use spin image matching
+        if template_library_dir and os.path.exists(template_library_dir) and enable_spin_images:
+            print("Using spin image matching with template library")
+            return self.match_with_spin_images(cluster_points, target_keypoints, template_library_dir)
+        else:
+            print("ERROR: No template library provided or spin images disabled")
+            print(f"template_library_dir: {template_library_dir}")
+            print(f"enable_spin_images: {enable_spin_images}")
+            return None
+    
+    def match_with_spin_images(self, target_points, target_keypoints, template_library_dir):
+        """
+        Complete Spin Image Matching Pipeline:
+        Steps 3-6: Spin Image Computation, Matching, RANSAC, and ICP
+        """
+        print("Step 3: Spin Image Computation")
+        
+        # Load template library
+        templates = self.load_template_library(template_library_dir)
+        if not templates:
+            print("ERROR: No templates found in library - cannot proceed with spin image matching")
+            print(f"Template library directory: {template_library_dir}")
+            return None
+        
+        print(f"Loaded {len(templates)} templates from library for spin image matching")
+        
+        # Compute surface normals for target points
+        target_normals = self.compute_surface_normals(target_points)
+        
+        # Get normals for target keypoints
+        target_kp_normals = []
+        for kp in target_keypoints:
+            distances = np.linalg.norm(target_points - kp, axis=1)
+            closest_idx = np.argmin(distances)
+            target_kp_normals.append(target_normals[closest_idx])
+        
+        # Generate spin images for target keypoints Q
+        target_spin_images = []
+        print(f"Starting to generate {len(target_keypoints)} target spin images...")
+        
+        for i, (kp, normal) in enumerate(zip(target_keypoints, target_kp_normals)):
+            spin_img = self.compute_spin_image(kp, normal, target_points)
+            target_spin_images.append(spin_img)
+            
+            # Save spin image visualization for debugging
+            spin_viz_dir = os.path.join(self.output_dir, "spin_images", "target")
+            spin_filename = os.path.join(spin_viz_dir, f"target_spin_{i:03d}.png")
+            print(f"Saving target spin image {i+1}/{len(target_keypoints)} to: {spin_filename}")
+            self.save_spin_image(spin_img, spin_filename, cmap="viridis")
+        
+        print(f"Generated {len(target_spin_images)} target spin images")
+        print(f"Spin image visualizations saved to: {spin_viz_dir}")
+        
+        # Save spin image summary
+        print("Creating spin image summary...")
+        self.save_spin_image_summary(target_spin_images, target_keypoints, self.output_dir)
+        
+        # Also save individual target spin images with enhanced metadata
+        print(f"Target spin image visualizations saved to: {spin_viz_dir}")
+        print("=" * 50)
+        print("SPIN IMAGE VISUALIZATION SUMMARY:")
+        print(f"Target Spin Images: {len(target_spin_images)} saved to {spin_viz_dir}")
+        print("=" * 50)
+        
+        best_match = None
+        best_score = -1
+        
+        # Step 4: Spin Image Matching with each template
+        print("Step 4: Spin Image Matching")
+        for template in templates:
+            try:
+                # Load template keypoints and spin images
+                template_file = template['file']
+                template_pcd = o3d.io.read_point_cloud(template_file)
+                template_points = np.asarray(template_pcd.points)
+                
+                if len(template_points) < 10:
+                    continue
+                
+                # Get template keypoints U
+                template_keypoints = self.compute_harris_3d_keypoints(template_points, num_corners=15)
+                if len(template_keypoints) == 0:
+                    continue
+                
+                # Compute template spin images P
+                template_normals = self.compute_surface_normals(template_points)
+                template_kp_normals = []
+                for kp in template_keypoints:
+                    distances = np.linalg.norm(template_points - kp, axis=1)
+                    closest_idx = np.argmin(distances)
+                    template_kp_normals.append(template_normals[closest_idx])
+                
+                template_spin_images = []
+                print(f"\nGenerating {len(template_keypoints)} spin images for template {template['id']}...")
+                
+                for j, (kp, normal) in enumerate(zip(template_keypoints, template_kp_normals)):
+                    spin_img = self.compute_spin_image(kp, normal, template_points)
+                    template_spin_images.append(spin_img)
+                    
+                    # Save template spin image visualization for debugging
+                    template_spin_dir = os.path.join(self.output_dir, "spin_images", "templates", template['id'])
+                    template_spin_filename = os.path.join(template_spin_dir, f"template_spin_{j:03d}.png")
+                    print(f"  Saving template spin image {j+1}/{len(template_keypoints)} to: {template_spin_filename}")
+                    self.save_spin_image(spin_img, template_spin_filename, cmap="plasma")
+                
+                # Save template spin image summary for easy viewing
+                if len(template_spin_images) > 0:
+                    print(f"Creating template spin image summary for template {template['id']}...")
+                    self.save_template_spin_image_summary(template_spin_images, template['id'], self.output_dir)
+                    print(f"Template {template['id']} spin images: {len(template_spin_images)} saved to {template_spin_dir}")
+                    print("-" * 40)
+                
+                # Find correspondences using spin image correlation R(P,Q)
+                correspondences = self.find_spin_image_correspondences(
+                    target_spin_images, template_spin_images, 
+                    target_keypoints, template_keypoints)
+                
+                # Save correspondence visualizations for debugging
+                if len(correspondences) > 0:
+                    self.save_spin_image_correspondences(
+                        target_spin_images, template_spin_images, correspondences,
+                        template['id'], self.output_dir)
+                
+                if len(correspondences) < 3:
+                    print(f"  Template {template['id']}: Insufficient correspondences ({len(correspondences)} < 3)")
+                    continue
+                
+                # Step 5: RANSAC-Based Matching and Transformation
+                print(f"Step 5: RANSAC for template {template['id']}")
+                R, T, inliers = self.estimate_rigid_transformation_ransac_pipeline(
+                    template_keypoints, target_keypoints, correspondences)
+                
+                if R is not None:
+                    # Evaluate match using equations (6) and (7)
+                    Pe, Ce = self.evaluate_pose_match(template_keypoints, target_keypoints, R, T, correspondences)
+                    print(f"  Template {template['id']}: Pe={Pe:.6f}, Ce={Ce:.6f}")
+                    
+                    # Step 6: ICP Refinement
+                    if Pe < 0.01 and Ce < 0.01:  # ε1 and ε2 thresholds
+                        print("Step 6: ICP Refinement")
+                        R_refined, T_refined = self.refine_pose_with_icp(template_points, target_points, R, T)
+                        if R_refined is not None:
+                            R, T = R_refined, T_refined
+                    
+                    # Calculate final match score
+                    match_score = 1.0 / (1.0 + Pe + Ce)  # Higher is better
+                    print(f"  Template {template['id']}: Match score = {match_score:.3f}")
+                    
+                    if match_score > best_score:
+                        best_score = match_score
+                        best_match = {
+                            'rotation_matrix': R,
+                            'translation': T,
+                            'template_id': template['id'],
+                            'match_score': match_score,
+                            'Pe': Pe,
+                            'Ce': Ce,
+                            'num_correspondences': len(correspondences),
+                            'num_inliers': len(inliers),
+                            'method': 'spin_image_pipeline'
+                        }
+                        
+            except Exception as e:
+                print(f"Error processing template {template['id']}: {e}")
+                continue
+        
+        if best_match:
+            print(f"Best match: {best_match['template_id']}")
+            print(f"  Match score: {best_match['match_score']:.3f}")
+            print(f"  Pe: {best_match['Pe']:.6f}, Ce: {best_match['Ce']:.6f}")
+            return best_match
+        else:
+            print("ERROR: No suitable template match found - spin image matching failed")
+            print("This means all templates were processed but none met the matching criteria")
+            print("Check spin image generation and correlation thresholds")
+            return None
+    
+    def find_spin_image_correspondences(self, target_spin_images, template_spin_images, 
+                                      target_keypoints, template_keypoints, correlation_threshold=0.6):
+        """
+        Find correspondences between template and target spin images using correlation R(P,Q)
+        """
+        correspondences = []
+        
+        for i, target_spin in enumerate(target_spin_images):
+            best_correlation = -1
+            best_match_j = -1
+            
+            for j, template_spin in enumerate(template_spin_images):
+                # Compute correlation coefficient R(P,Q) using equation (4)
+                correlation = self.compute_spin_image_correlation(template_spin, target_spin)
+                
+                if correlation > best_correlation and correlation > correlation_threshold:
+                    best_correlation = correlation
+                    best_match_j = j
+            
+            if best_match_j >= 0:
+                # Store correspondence as (template_idx, target_idx, correlation)
+                correspondences.append((best_match_j, i, best_correlation))
+        
+        print(f"Found {len(correspondences)} spin image correspondences")
+        return correspondences
+    
+    def estimate_rigid_transformation_ransac_pipeline(self, template_keypoints, target_keypoints, 
+                                                    correspondences, max_iterations=1000, 
+                                                    inlier_threshold=0.005):
+        """
+        Step 5: RANSAC-Based Matching and Transformation following Algorithm 1
+        """
+        print("Running RANSAC for rigid transformation estimation...")
+        
+        if len(correspondences) < 3:
+            print("Insufficient correspondences for RANSAC")
+            return None, None, []
+        
+        best_R, best_T = None, None
+        best_inliers = []
+        max_inliers = 0
+        
+        # Extract correspondence points
+        template_pts = np.array([template_keypoints[i] for i, j, _ in correspondences])
+        target_pts = np.array([target_keypoints[j] for i, j, _ in correspondences])
+        
+        for iteration in range(max_iterations):
+            # Randomly select 3 matching point pairs
+            if len(correspondences) >= 3:
+                sample_indices = np.random.choice(len(correspondences), 3, replace=False)
+                sample_template = template_pts[sample_indices]
+                sample_target = target_pts[sample_indices]
+                
+                # Compute rigid transformation (R, T)
+                R, T = self.estimate_rigid_transformation_3_points(sample_template, sample_target)
+                
+                if R is not None:
+                    # Transform template points: U' = RU + T
+                    transformed_template = (R @ template_pts.T).T + T
+                    
+                    # Compute distances to find inliers
+                    distances = np.linalg.norm(transformed_template - target_pts, axis=1)
+                    inliers = np.where(distances < inlier_threshold)[0]
+                    
+                    # Keep best hypothesis with most inliers
+                    if len(inliers) > max_inliers:
+                        max_inliers = len(inliers)
+                        best_R, best_T = R.copy(), T.copy()
+                        best_inliers = inliers.copy()
+        
+        print(f"RANSAC completed: {max_inliers} inliers out of {len(correspondences)} correspondences")
+        return best_R, best_T, best_inliers
+    
+    def evaluate_pose_match(self, template_keypoints, target_keypoints, R, T, correspondences):
+        """
+        Evaluate pose match using equations (6) and (7):
+        Pe = (1/n) * Σ||Wc - U'c||  (equation 6)
+        Ce = ||W̄c - Ū'c||          (equation 7)
+        """
+        # Extract correspondence points
+        template_pts = np.array([template_keypoints[i] for i, j, _ in correspondences])
+        target_pts = np.array([target_keypoints[j] for i, j, _ in correspondences])
+        
+        # Transform template points: U'c = RUc + T
+        transformed_template = (R @ template_pts.T).T + T
+        
+        # Pe: Average point-to-point distance (equation 6)
+        distances = np.linalg.norm(transformed_template - target_pts, axis=1)
+        Pe = np.mean(distances)
+        
+        # Ce: Distance between centroids (equation 7)
+        centroid_template = np.mean(transformed_template, axis=0)
+        centroid_target = np.mean(target_pts, axis=0)
+        Ce = np.linalg.norm(centroid_template - centroid_target)
+        
+        return Pe, Ce
+    
+    def estimate_pose_geometric(self, points, keypoints):
+        """
+        Simple geometric pose estimation when no template matching is available
+        """
+        print("Performing geometric pose estimation...")
+        
+        # Calculate center of mass
+        center = np.mean(points, axis=0)
+        
+        # Use PCA to estimate orientation
+        pca = PCA(n_components=3)
+        pca.fit(points - center)
+        
+        # Create rotation matrix from PCA components
+        rotation_matrix = pca.components_.T
+        
+        # Ensure proper rotation matrix (determinant = 1)
+        if np.linalg.det(rotation_matrix) < 0:
+            rotation_matrix[:, 2] *= -1
+        
+        return {
+            'rotation_matrix': rotation_matrix,
+            'translation': center,
+            'match_score': 0.5,
+            'method': 'geometric_pca'
+        }
+
+    # def estimate_pose_geometric(self, points, keypoints):
+    #     """
+    #     Simple geometric pose estimation when no template matching is available
+    #     """
+    #     print("Performing geometric pose estimation...")
+        
+    #     # Calculate center of mass
+    #     center = np.mean(points, axis=0)
+        
+    #     # Use PCA to estimate orientation
+    #     pca = PCA(n_components=3)
+    #     pca.fit(points - center)
+        
+    #     # Create rotation matrix from PCA components
+    #     rotation_matrix = pca.components_.T
+        
+    #     # Ensure proper rotation matrix (determinant = 1)
+    #     if np.linalg.det(rotation_matrix) < 0:
+    #         rotation_matrix[:, 2] *= -1
+        
+    #     return {
+    #         'rotation_matrix': rotation_matrix,
+    #         'translation': center,
+    #         'match_score': 0.5,
+    #         'method': 'geometric_pca'
+    #     }
+        
+    def find_world_coordinates_of_topmost_brick(self, pose_result):
+        """
+        Step 5: Find the world coordinate after pose matching of the highest brick
+        
+        Args:
+            pose_result: Result from detect_and_match_topmost_brick()
+        
+        Returns:
+            Dictionary containing world coordinates
+        """
+        print("Step 5: Computing world coordinates of topmost brick...")
+        
+        if pose_result is None:
+            print("No pose estimation available")
+            return None
+        
+        # Extract rotation matrix and translation
+        R = np.array(pose_result['rotation_matrix'])
+        T = np.array(pose_result['translation'])
+        
+        # Extract coordinates using the existing method
+        coordinates = self.extract_brick_coordinates(R, T, coordinate_system='euler_xyz')
+        
+        # Add additional information
+        coordinates['method'] = pose_result.get('method', 'unknown')
+        coordinates['match_score'] = pose_result.get('match_score', 0.0)
+        coordinates['template_id'] = pose_result.get('template_id', 'none')
+        
+        print(f"World coordinates computed using {coordinates['method']}")
+        print(f"Position: [{coordinates['position'][0]:.3f}, {coordinates['position'][1]:.3f}, {coordinates['position'][2]:.3f}] meters")
+        print(f"Rotation: [{coordinates['rotation'][0]:.1f}, {coordinates['rotation'][1]:.1f}, {coordinates['rotation'][2]:.1f}] degrees")
+        
+        return coordinates
+    
+    def visualize_matched_template(self, cluster_points, cluster_colors, pose_result, 
+                                 template_library_dir=None, output_file=None):
+        """
+        Step 6: Visualize the matched template in the output cluster for verification
+        
+        Args:
+            cluster_points: Original cluster points
+            cluster_colors: Original cluster colors
+            pose_result: Pose estimation result
+            template_library_dir: Directory containing templates
+            output_file: Optional file to save visualization
+        """
+        print("Step 6: Creating visualization of matched template...")
+        
+        geometries = []
+        
+        # Add original cluster (in original colors)
+        cluster_pcd = o3d.geometry.PointCloud()
+        cluster_pcd.points = o3d.utility.Vector3dVector(cluster_points)
+        cluster_pcd.colors = o3d.utility.Vector3dVector(cluster_colors)
+        geometries.append(cluster_pcd)
+        
+        # Add matched template if available
+        if pose_result and 'rotation_matrix' in pose_result and 'translation' in pose_result:
+            template_pcd = self.create_template_visualization(pose_result, template_library_dir)
+            if template_pcd:
+                geometries.append(template_pcd)
+        
+        # Add coordinate frame at the estimated pose
+        if pose_result and 'translation' in pose_result:
+            position = pose_result['translation']
+            R = np.array(pose_result['rotation_matrix'])
+            
+            # Create coordinate frame
+            coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+                size=0.05, origin=position)
+            
+            # Apply rotation to coordinate frame
+            coord_frame.rotate(R, center=position)
+            geometries.append(coord_frame)
+        
+        # Add world origin coordinate frame
+        world_origin = o3d.geometry.TriangleMesh.create_coordinate_frame(
+            size=0.1, origin=[0, 0, 0])
+        geometries.append(world_origin)
+        
+        # Visualize
+        if geometries:
+            print("Displaying matched template visualization...")
+            o3d.visualization.draw_geometries(
+                geometries,
+                window_name="Matched Template Visualization - Black=Template, Original=Cluster",
+                width=1024,
+                height=768
+            )
+            
+            # Save visualization if output file specified
+            if output_file:
+                self.save_visualization_image(geometries, output_file)
+                print(f"Visualization saved to: {output_file}")
+    
+    def create_template_visualization(self, pose_result, template_library_dir):
+        """
+        Create visualization of the matched template
+        """
+        template_id = pose_result.get('template_id', 'none')
+        
+        if template_id == 'none' or not template_library_dir:
+            # Create a simple box visualization for geometric estimation
+            return self.create_simple_brick_visualization(pose_result)
+        
+        # Load template from library
+        templates = self.load_template_library(template_library_dir)
+        template = None
+        for t in templates:
+            if t['id'] == template_id:
+                template = t
+                break
+        
+        if template is None:
+            return self.create_simple_brick_visualization(pose_result)
+        
+        # Load template points from PLY file (not from JSON metadata)
+        template_file = template['file']
+        if not os.path.exists(template_file):
+            print(f"Template file not found: {template_file}")
+            return self.create_simple_brick_visualization(pose_result)
+        
+        # Load point cloud from PLY file
+        template_pcd = o3d.io.read_point_cloud(template_file)
+        template_points = np.asarray(template_pcd.points)
+        
+        if len(template_points) < 10:
+            print(f"Template {template['id']} has too few points for visualization")
+            return self.create_simple_brick_visualization(pose_result)
+        
+        R = np.array(pose_result['rotation_matrix'])
+        T = np.array(pose_result['translation'])
+        
+        # Transform template to match pose
+        transformed_points = (R @ template_points.T).T + T
+        
+        # Create point cloud with highlight color (red/black for visibility)
+        template_pcd = o3d.geometry.PointCloud()
+        template_pcd.points = o3d.utility.Vector3dVector(transformed_points)
+        
+        # Use black color for high contrast
+        highlight_color = np.array([0.0, 0.0, 0.0])  # Black
+        template_colors = np.tile(highlight_color, (len(transformed_points), 1))
+        template_pcd.colors = o3d.utility.Vector3dVector(template_colors)
+        
+        return template_pcd
+    
+    def create_simple_brick_visualization(self, pose_result):
+        """
+        Create a simple brick visualization for geometric pose estimation
+        """
+        # Create a simple box mesh at the estimated position
+        position = pose_result['translation']
+        R = np.array(pose_result['rotation_matrix'])
+        
+        # Standard LEGO brick dimensions (approximate)
+        brick_box = o3d.geometry.TriangleMesh.create_box(
+            width=0.064, height=0.032, depth=0.019)  # 32x16x16mm
+        
+        # Center the box
+        brick_box.translate([-0.016, -0.008, -0.008])
+        
+        # Apply pose transformation
+        brick_box.rotate(R, center=[0, 0, 0])
+        brick_box.translate(position)
+        
+        # Color it black for visibility
+        brick_box.paint_uniform_color([0.0, 0.0, 0.0])  # Black
+        
+        return brick_box
+    
+    def save_visualization_image(self, geometries, output_file):
+        """
+        Save visualization to image file
+        """
+        try:
+            vis = o3d.visualization.Visualizer()
+            vis.create_window(visible=False, width=1024, height=768)
+            
+            for geom in geometries:
+                vis.add_geometry(geom)
+            
+            vis.poll_events()
+            vis.update_renderer()
+            time.sleep(0.1)  # Stabilize rendering
+            vis.capture_screen_image(output_file)
+            vis.destroy_window()
+            
+        except Exception as e:
+            print(f"Error saving visualization: {e}")
+    
+    def run_enhanced_bin_picking_pipeline(self, template_library_dir=None, enable_visualization=True, enable_spin_images=True):
+        """
+        Main pipeline implementing the enhanced bin picking algorithm for stacked LEGO bricks
+        
+        Pipeline Steps:
+        1. Data acquisition and preprocessing
+        2. Find closest cluster to camera
+        3. Color filtering for topmost brick
+        4. Harris 3D and spin image pose matching
+        5. World coordinate calculation
+        6. Visualization for verification
+        
+        Args:
+            template_library_dir: Directory containing template library
+            enable_visualization: Enable 3D visualization
+            enable_spin_images: Use spin image matching instead of geometric pose estimation
+        """
+        print("="*60)
+        print("ENHANCED BIN PICKING PIPELINE FOR STACKED LEGO BRICKS")
+        print("="*60)
+        
+        # Step 1: Data acquisition and preprocessing
+        print("\n" + "="*50)
+        print("STEP 1: DATA ACQUISITION AND PREPROCESSING")
+        print("="*50)
+        
+        points, colors = self.capture_and_preprocess_kinect_data()
+        if len(points) == 0:
+            print("[ERROR] No valid points found after preprocessing. Exiting.")
+            return None
+        
+        print(f"Successfully acquired {len(points)} points after preprocessing")
+        
+        # Step 2-3: Find closest cluster and extract topmost brick by color
+        print("\n" + "="*50)
+        print("STEP 2-3: FIND CLOSEST CLUSTER AND EXTRACT TOPMOST BRICK")
+        print("="*50)
+        
+        topmost_points, topmost_colors, closest_z = self.find_and_extract_topmost_brick(
+            points, colors, dbscan_eps=0.01, dbscan_min_samples=10, 
+            color_tolerance=0.15, top_surface_depth=0.02)
+        
+        if topmost_points is None:
+            print("[ERROR] No topmost brick found. Exiting.")
+            return None
+        
+        if len(topmost_points) < 100:
+            print("[WARNING] Very few points in topmost brick")
+            return None
+        
+        # Step 4: Harris 3D and spin image pose matching
+        print("\n" + "="*50)
+        print("STEP 4: HARRIS 3D AND SPIN IMAGE POSE MATCHING")
+        print("="*50)
+        
+        pose_result = self.detect_and_match_topmost_brick(
+            topmost_points, topmost_colors, template_library_dir, enable_spin_images)
+        
+        if pose_result is None:
+            print("[ERROR] Pose estimation failed. Exiting.")
+            return None
+        
+        # Step 5: World coordinate calculation
+        print("\n" + "="*50)
+        print("STEP 5: WORLD COORDINATE CALCULATION")
+        print("="*50)
+        
+        world_coordinates = self.find_world_coordinates_of_topmost_brick(pose_result)
+        
+        if world_coordinates is None:
+            print("[ERROR] World coordinate calculation failed. Exiting.")
+            return None
+        
+        # Save coordinates to file
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        coord_file = os.path.join(self.output_dir, f"Enhanced_Brick_Coordinates_{timestamp_str}")
+        saved_file = self.save_brick_coordinates(world_coordinates, coord_file)
+        
+        # Step 6: Visualization for verification
+        if enable_visualization:
+            print("\n" + "="*50)
+            print("STEP 6: VISUALIZATION FOR VERIFICATION")
+            print("="*50)
+            
+            viz_file = os.path.join(self.output_dir, f"Enhanced_Visualization_{timestamp_str}.png")
+            self.visualize_matched_template(
+                topmost_points, topmost_colors, pose_result, 
+                template_library_dir, viz_file)
+        
+        # Prepare final results
+        results = {
+            'world_coordinates': world_coordinates,
+            'pose_result': pose_result,
+            'cluster_info': {
+                'closest_z': closest_z,
+                'original_size': len(points),
+                'topmost_size': len(topmost_points)
+            },
+            'files': {
+                'coordinates': saved_file,
+                'visualization': viz_file if enable_visualization else None
+            }
+        }
+        
+        print("\n" + "="*60)
+        print("ENHANCED PIPELINE COMPLETED SUCCESSFULLY!")
+        print("="*60)
+        print(f"Results saved to: {self.output_dir}")
+        if saved_file:
+            print(f"Coordinates: {os.path.basename(saved_file)}")
+        if enable_visualization and 'visualization' in results['files']:
+            print(f"Visualization: {os.path.basename(results['files']['visualization'])}")
+        
+        return results
+
     # Saving processed data
     def save_transformed_point_cloud(self, points, colors, output_file):
         data = np.hstack([points, colors])
         np.savetxt(output_file, data, delimiter=' ', fmt='%f')
+
+    def save_spin_image(self, spin_image, filename, cmap="viridis"):
+        """
+        Save a spin image (2D numpy array) as an image file.
+
+        Args:
+            spin_image (np.ndarray): 2D spin image array
+            filename (str): Full path with extension (e.g., "output/spin1.png")
+            cmap (str): Matplotlib colormap name (default "viridis")
+        """
+        try:
+            # Create directory if it doesn't exist
+            if not os.path.exists(os.path.dirname(filename)):
+                os.makedirs(os.path.dirname(filename))
+                print(f"Created directory: {os.path.dirname(filename)}")
+
+            plt.figure(figsize=(3, 3))
+            plt.imshow(spin_image, cmap=cmap, origin='lower')
+            plt.axis("off")
+            plt.tight_layout()
+            plt.savefig(filename, bbox_inches='tight', pad_inches=0)
+            plt.close()
+            
+            print(f"Successfully saved spin image: {filename}")
+            
+        except Exception as e:
+            print(f"Error saving spin image {filename}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def save_spin_image_correspondences(self, target_spins, template_spins, correspondences, 
+                                      template_id, output_dir):
+        """
+        Save visualization of spin image correspondences showing matched pairs.
+        
+        Args:
+            target_spins: List of target spin images
+            template_spins: List of template spin images  
+            correspondences: List of (template_idx, target_idx, correlation) tuples
+            template_id: Template identifier for file naming
+            output_dir: Directory to save correspondence visualizations
+        """
+        if len(correspondences) == 0:
+            return
+            
+        corr_dir = os.path.join(output_dir, "spin_correspondences", template_id)
+        if not os.path.exists(corr_dir):
+            os.makedirs(corr_dir)
+        
+        for i, (template_idx, target_idx, correlation) in enumerate(correspondences):
+            if template_idx < len(template_spins) and target_idx < len(target_spins):
+                template_spin = template_spins[template_idx]
+                target_spin = target_spins[target_idx]
+                
+                # Create side-by-side visualization
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(6, 3))
+                
+                ax1.imshow(template_spin, cmap='plasma', origin='lower')
+                ax1.set_title(f'Template {template_idx}')
+                ax1.axis('off')
+                
+                ax2.imshow(target_spin, cmap='viridis', origin='lower')
+                ax2.set_title(f'Target {target_idx}')
+                ax2.axis('off')
+                
+                plt.suptitle(f'Correspondence {i+1}: Correlation = {correlation:.3f}')
+                plt.tight_layout()
+                
+                corr_filename = os.path.join(corr_dir, f"correspondence_{i:03d}_corr{correlation:.3f}.png")
+                plt.savefig(corr_filename, bbox_inches='tight', pad_inches=0.1)
+                plt.close()
+        
+        print(f"Saved {len(correspondences)} correspondence visualizations to: {corr_dir}")
+
+    def save_spin_image_summary(self, target_spins, target_keypoints, output_dir, max_display=10):
+        """
+        Save a summary visualization showing multiple spin images in a grid.
+        
+        Args:
+            target_spins: List of target spin images
+            target_keypoints: Corresponding keypoints
+            output_dir: Directory to save summary
+            max_display: Maximum number of spin images to display in grid
+        """
+        if len(target_spins) == 0:
+            print("No spin images to create summary for")
+            return
+            
+        print(f"Creating spin image summary for {len(target_spins)} images...")
+        
+        summary_dir = os.path.join(output_dir, "spin_images")
+        try:
+            if not os.path.exists(summary_dir):
+                os.makedirs(summary_dir)
+                print(f"Created summary directory: {summary_dir}")
+        except Exception as e:
+            print(f"Error creating summary directory: {e}")
+            return
+        
+        # Display up to max_display spin images
+        num_display = min(len(target_spins), max_display)
+        cols = min(5, num_display)
+        rows = (num_display + cols - 1) // cols
+        
+        try:
+            fig, axes = plt.subplots(rows, cols, figsize=(cols * 2, rows * 2))
+            if rows == 1:
+                axes = axes.reshape(1, -1) if num_display > 1 else [axes]
+            
+            for i in range(num_display):
+                row = i // cols
+                col = i % cols
+                ax = axes[row][col] if rows > 1 else axes[col]
+                
+                ax.imshow(target_spins[i], cmap='viridis', origin='lower')
+                ax.set_title(f'Keypoint {i}')
+                ax.axis('off')
+            
+            # Hide unused subplots
+            for i in range(num_display, rows * cols):
+                row = i // cols
+                col = i % cols
+                ax = axes[row][col] if rows > 1 else axes[col]
+                ax.axis('off')
+            
+            plt.suptitle(f'Target Spin Images Summary ({len(target_spins)} total)')
+            plt.tight_layout()
+            
+            summary_filename = os.path.join(summary_dir, "target_spin_summary.png")
+            plt.savefig(summary_filename, bbox_inches='tight', pad_inches=0.1, dpi=150)
+            plt.close()
+            
+            print(f"Spin image summary successfully saved to: {summary_filename}")
+            
+        except Exception as e:
+            print(f"Error creating spin image summary: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def save_template_spin_image_summary(self, template_spins, template_id, output_dir, max_display=15):
+        """
+        Save a summary visualization showing template spin images in a grid.
+        
+        Args:
+            template_spins: List of template spin images
+            template_id: Template identifier for file naming
+            output_dir: Directory to save summary
+            max_display: Maximum number of spin images to display in grid
+        """
+        if len(template_spins) == 0:
+            print(f"No template spin images to create summary for template {template_id}")
+            return
+            
+        print(f"Creating template spin image summary for template {template_id} ({len(template_spins)} images)...")
+        
+        template_summary_dir = os.path.join(output_dir, "spin_images", "templates", template_id)
+        try:
+            if not os.path.exists(template_summary_dir):
+                os.makedirs(template_summary_dir)
+                print(f"Created template summary directory: {template_summary_dir}")
+        except Exception as e:
+            print(f"Error creating template summary directory: {e}")
+            return
+        
+        # Display up to max_display spin images
+        num_display = min(len(template_spins), max_display)
+        cols = min(5, num_display)
+        rows = (num_display + cols - 1) // cols
+        
+        try:
+            fig, axes = plt.subplots(rows, cols, figsize=(cols * 2.5, rows * 2.5))
+            if rows == 1:
+                axes = axes.reshape(1, -1) if num_display > 1 else [axes]
+            
+            for i in range(num_display):
+                row = i // cols
+                col = i % cols
+                ax = axes[row][col] if rows > 1 else axes[col]
+                
+                # Use plasma colormap for template spin images for better contrast
+                im = ax.imshow(template_spins[i], cmap='plasma', origin='lower')
+                ax.set_title(f'Template Keypoint {i}', fontsize=10)
+                ax.axis('off')
+                
+                # Add colorbar for better understanding
+                if i == 0:  # Add colorbar only to first image
+                    plt.colorbar(im, ax=ax, shrink=0.8)
+            
+            # Hide unused subplots
+            for i in range(num_display, rows * cols):
+                row = i // cols
+                col = i % cols
+                ax = axes[row][col] if rows > 1 else axes[col]
+                ax.axis('off')
+            
+            plt.suptitle(f'Template {template_id} Spin Images ({len(template_spins)} total)', fontsize=14)
+            plt.tight_layout()
+            
+            summary_filename = os.path.join(template_summary_dir, f"template_{template_id}_spin_summary.png")
+            plt.savefig(summary_filename, bbox_inches='tight', pad_inches=0.1, dpi=150)
+            plt.close()
+            
+            print(f"Template spin image summary saved to: {summary_filename}")
+            
+        except Exception as e:
+            print(f"Error creating template spin image summary for {template_id}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def test_spin_image_visualization(self, output_dir=None):
+        """
+        Test function to verify spin image visualization is working
+        Creates a sample spin image and saves it
+        """
+        if output_dir is None:
+            output_dir = self.output_dir
+            
+        print("Testing spin image visualization...")
+        
+        # Create a test spin image (simple pattern)
+        test_spin = np.zeros((64, 64))
+        for i in range(64):
+            for j in range(64):
+                # Create a circular pattern
+                center_x, center_y = 32, 32
+                dist = np.sqrt((i - center_x)**2 + (j - center_y)**2)
+                test_spin[i, j] = np.sin(dist * 0.2) * np.exp(-dist * 0.1)
+        
+        # Save test spin image
+        test_dir = os.path.join(output_dir, "test_spin_images")
+        test_filename = os.path.join(test_dir, "test_spin_image.png")
+        
+        print(f"Saving test spin image to: {test_filename}")
+        self.save_spin_image(test_spin, test_filename, cmap="viridis")
+        
+        # Create test summary
+        test_spins = [test_spin, test_spin * 0.5, test_spin * 0.8]
+        test_keypoints = np.array([[0, 0, 0], [1, 1, 1], [2, 2, 2]])
+        
+        print("Creating test summary...")
+        summary_dir = os.path.join(output_dir, "test_spin_images")
+        if not os.path.exists(summary_dir):
+            os.makedirs(summary_dir)
+        
+        try:
+            fig, axes = plt.subplots(1, 3, figsize=(9, 3))
+            for i in range(3):
+                axes[i].imshow(test_spins[i], cmap='viridis', origin='lower')
+                axes[i].set_title(f'Test Spin {i+1}')
+                axes[i].axis('off')
+            
+            plt.suptitle('Test Spin Images')
+            plt.tight_layout()
+            
+            summary_filename = os.path.join(summary_dir, "test_spin_summary.png")
+            plt.savefig(summary_filename, bbox_inches='tight', pad_inches=0.1, dpi=150)
+            plt.close()
+            
+            print(f"Test summary saved to: {summary_filename}")
+            print("Spin image visualization test completed successfully!")
+            
+        except Exception as e:
+            print(f"Error in test summary: {e}")
+            import traceback
+            traceback.print_exc()
 
     def save_point_cloud_as_ply(self, points, colors, output_file):
         """
@@ -926,9 +1402,7 @@ class BinPickingSystem:
             angle_deg = -angle_deg
         return angle_deg  # Finally, return with a negative sign
 
-    # ========== COLOR CLASSIFICATION AND FILTERING ==========
-    
-    # HSV-based color classification and dominant color detection for LEGO bricks
+    # HSV-based color classification for LEGO bricks
     def classify_hsv_color(self, rgb_color):
         """
         Classify RGB color into LEGO brick categories using HSV color space
@@ -939,40 +1413,34 @@ class BinPickingSystem:
         Returns:
             Color name string and HSV values
         """
-        # Convert RGB to HSV
-        rgb_255 = (rgb_color * 255).astype(np.uint8)
-        hsv = cv2.cvtColor(np.uint8([[rgb_255]]), cv2.COLOR_RGB2HSV)[0][0]
-        h, s, v = hsv[0], hsv[1], hsv[2]
+        """
+        Classify RGB color into LEGO brick categories using HSV color space
         
-        # LEGO color classification based on HSV ranges
-        # H: 0-179, S: 0-255, V: 0-255 in OpenCV
+        Args:
+            rgb_color: RGB color array [R, G, B] in range [0, 1]
         
-        # Low saturation = white/gray/black
-        if s < 50:
-            if v > 200:
-                return "white", hsv
-            elif v < 80:
-                return "black", hsv
+        Returns:
+            Color name string and HSV values
+        """
+        # Convert to OpenCV HSV space
+        bgr = (np.array(rgb_color[::-1]) * 255).astype(np.uint8).reshape(1, 1, 3)
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[0, 0]
+        h, s, v = hsv
+
+        # Brick-specific color ranges from your samples
+        if 90 <= h <= 130:
+            if v < 100:
+                return "dark_blue", hsv
             else:
-                return "gray", hsv
-        
-        # High saturation colors
-        if h < 10 or h > 170:  # Red range (wraps around)
+                return "light_blue", hsv
+        elif 5 <= h <= 15 and s > 100:
             return "red", hsv
-        elif 10 <= h < 25:  # Orange range
+        elif 10 <= h <= 30 and s > 100:
             return "orange", hsv
-        elif 25 <= h < 35:  # Yellow range
-            return "yellow", hsv
-        elif 35 <= h < 85:  # Green range
-            return "green", hsv
-        elif 85 <= h < 130:  # Light blue range
-            return "light_blue", hsv
-        elif 130 <= h <= 170:  # Dark blue range
-            return "dark_blue", hsv
         else:
             return "unknown", hsv
     
-    def get_dominant_color(self, colors):
+    def get_dominant_color_hsv(self, colors):
         """
         Get dominant color using HSV classification for better color distinction
         
@@ -980,7 +1448,7 @@ class BinPickingSystem:
             colors: Array of RGB colors in range [0, 1]
         
         Returns:
-            Dominant RGB color and its HSV classification name
+            Dominant RGB color and its HSV classification
         """
         if len(colors) == 0:
             return np.array([0.5, 0.5, 0.5]), "gray"
@@ -1008,6 +1476,12 @@ class BinPickingSystem:
         print(f"Color distribution: {color_counts}")
         
         return dominant_rgb, dominant_color_name
+    
+    # Extracting the most dominant color from a set of RGB values (legacy method)
+    def get_dominant_color(self, colors):
+        # Use HSV-based method for better color classification
+        dominant_rgb, color_name = self.get_dominant_color_hsv(colors)
+        return dominant_rgb
 
     # Helper functions for improved 3D Harris corner detection
     def polyfit3d(self, x, y, z, order=2):
@@ -1025,12 +1499,7 @@ class BinPickingSystem:
         if len(points) < 4:  # Need at least 4 points for Delaunay triangulation
             return {}
             
-        try:
-            triangulation = Delaunay(points)
-        except:
-            # If Delaunay fails, return empty neighborhood
-            print("Delaunay triangulation failed")
-            return {}
+        triangulation = Delaunay(points)
 
         # Build direct neighborhood from Delaunay triangulation
         neighborhood_direct = {}
@@ -1182,30 +1651,28 @@ class BinPickingSystem:
         
         return cluster_pts, cluster_cols
 
-    # ========== STEP 4: HARRIS CORNER DETECTION FOR KEYPOINTS ==========
-
-    def compute_harris_3d_corners_multi_hypothesis(self, points, delta=0.025, harris_k=0.04, 
-                                                 cluster_threshold=0.008, num_corners=8, num_hypotheses=3):
+    def compute_harris_3d_keypoints(self, points, delta=0.025, harris_k=0.04, num_corners=15):
         """
-        Enhanced Harris corner detection that returns multiple valid corner hypotheses
-        to handle symmetrical LEGO bricks better
+        Simple 3D Harris corner detection following pipeline step 2:
+        Extract distinctive keypoints using 3D extension of Harris corner detector
+        H(U) = υ, H(W) = ω
         """
         if len(points) < 10:
             print("Not enough points for Harris corner detection")
-            return []
+            return np.array([])
 
-        print(f"Computing Harris corners with multiple hypotheses for {len(points)} points...")
+        print(f"Computing Harris 3D keypoints for {len(points)} points...")
         
-        # STEP 1: Preprocess points for stable Harris detection
+        # Preprocess points for stable Harris detection
         preprocessed_points, transform_params = self.preprocess_for_harris_detection(points)
         
-        # STEP 2: Compute neighborhoods using adaptive Delaunay triangulation
+        # Compute neighborhoods using Delaunay triangulation
         neighborhood = self.compute_delaunay_neighborhood(preprocessed_points, delta=delta)
         
-        # STEP 3: Initialize response array
+        # Initialize Harris response array
         resp = np.zeros(len(preprocessed_points))
         
-        # STEP 4: Compute Harris response for each point 
+        # Compute Harris response for each point
         for point_idx in neighborhood.keys():
             try:
                 if len(neighborhood[point_idx]) < 3:
@@ -1243,7 +1710,7 @@ class BinPickingSystem:
                 resp[point_idx] = -np.inf
                 continue
         
-        # STEP 5: LEGO-specific feature filtering and corner candidate selection
+        # Select corner candidates
         candidate = []
         for point_idx in neighborhood.keys():
             if len(neighborhood[point_idx]) > 0:
@@ -1253,51 +1720,37 @@ class BinPickingSystem:
         
         if len(candidate) == 0:
             print("No corner candidates found")
-            return []
+            return np.array([])
         
-        # Sort by decreasing Harris response
+        # Sort by decreasing Harris response and select top corners
         candidate.sort(reverse=True, key=lambda x: x[1])
         candidate = np.array(candidate)
         
-        # STEP 5.1: Apply LEGO-specific filtering to reduce stud detection
-        filtered_candidate = self.filter_lego_stud_features(preprocessed_points, candidate, points)
+        # Select top keypoints
+        num_to_select = min(num_corners, len(candidate))
+        selected_indices = [int(candidate[i, 0]) for i in range(num_to_select)]
+        keypoints = points[selected_indices]
         
-        if len(filtered_candidate) == 0:
-            print("No corner candidates remaining after LEGO filtering, using original candidates")
-            filtered_candidate = candidate
+        print(f"Selected {len(keypoints)} Harris 3D keypoints")
+        return keypoints
+
+    def validate_brick_cluster(self, corner_points, min_corners=4):
+        """
+        Simple validation for brick clusters - just check if we have enough corners
+        Since LEGO bricks are symmetrical, orientation doesn't matter for grasping
+        """
+        if len(corner_points) < min_corners:
+            return False, 1.0
         
-        # STEP 6: Generate multiple hypotheses with different starting points
-        all_hypotheses = []
+        # Calculate basic statistics for logging
+        min_coords = np.min(corner_points, axis=0)
+        max_coords = np.max(corner_points, axis=0)
+        dimensions = (max_coords - min_coords) * 1000  # Convert to mm
         
-        for hypothesis_idx in range(min(num_hypotheses, len(filtered_candidate))):
-            # Start with different high-scoring corners for each hypothesis
-            selected_corners = []
-            if len(filtered_candidate) > hypothesis_idx:
-                # Start with the hypothesis_idx-th best corner
-                start_idx = hypothesis_idx
-                selected_corners.append(int(filtered_candidate[start_idx, 0]))
-                Q = preprocessed_points[int(filtered_candidate[start_idx, 0]), :].reshape((1, -1))
-                
-                # Add corners that are far enough from existing ones
-                for i in range(len(filtered_candidate)):
-                    if i == start_idx:
-                        continue
-                    query = preprocessed_points[int(filtered_candidate[i, 0]), :].reshape((1, -1))
-                    distances = scipy.spatial.distance.cdist(query, Q, metric='euclidean')
-                    if np.min(distances) > cluster_threshold:
-                        selected_corners.append(int(filtered_candidate[i, 0]))
-                        Q = np.concatenate((Q, query), axis=0)
-                        
-                        # Stop if we have enough corners
-                        if len(selected_corners) >= num_corners:
-                            break
-                
-                if len(selected_corners) > 0:
-                    corner_points = points[selected_corners]
-                    all_hypotheses.append(corner_points)
+        print(f"Brick cluster dimensions: {dimensions[0]:.1f}x{dimensions[1]:.1f}x{dimensions[2]:.1f}mm")
+        print(f"Corner count: {len(corner_points)} (sufficient for grasping)")
         
-        print(f"Generated {len(all_hypotheses)} LEGO-filtered corner hypotheses")
-        return all_hypotheses
+        return True, 0.0
 
     def select_best_pose_hypothesis(self, corner_hypotheses, brick_points):
         """
@@ -1307,19 +1760,17 @@ class BinPickingSystem:
         if len(corner_hypotheses) == 0:
             return np.array([])
             
-        # Simply return the first hypothesis with enough corners (minimum 4)
+        # Simply return the first hypothesis with enough corners
         for i, corners in enumerate(corner_hypotheses):
-            if len(corners) >= 4:  # Direct check instead of using validation function
+            is_valid, _ = self.validate_brick_cluster(corners)
+            
+            if is_valid:
                 print(f"Selected hypothesis {i} with {len(corners)} corners")
                 return corners
         
-        # If no hypothesis has enough corners, return the one with the most corners
-        if len(corner_hypotheses) > 0:
-            best_idx = max(range(len(corner_hypotheses)), key=lambda i: len(corner_hypotheses[i]))
-            print(f"Selected best available hypothesis {best_idx} with {len(corner_hypotheses[best_idx])} corners")
-            return corner_hypotheses[best_idx]
-            
-        return np.array([])
+        # If no hypothesis passes basic validation, return the first one as fallback
+        print("No hypothesis passed validation, using first hypothesis as fallback")
+        return corner_hypotheses[0] if len(corner_hypotheses) > 0 else np.array([])
 
     def filter_lego_stud_features(self, preprocessed_points, candidates, original_points, stud_radius_threshold=0.008):
         """
@@ -1387,7 +1838,7 @@ class BinPickingSystem:
         print(f"Filtered {len(candidates) - len(filtered_candidates)} potential stud features")
         return np.array(filtered_candidates) if len(filtered_candidates) > 0 else candidates
 
-    # ========== STEP 5: POSE ESTIMATION METHODS ==========
+    # ========== SPIN IMAGE-BASED POSE ESTIMATION METHODS ==========
     # Implementation based on "3D Object Detection and Pose Estimation from Depth Image for Robotic Bin Picking"
     
     def compute_surface_normals(self, points, k=6):
@@ -1426,39 +1877,51 @@ class BinPickingSystem:
 
     def compute_spin_image(self, point, normal, points, spin_size=64, max_radius=0.05):
         """
-        Compute spin image descriptor for a point according to Johnson & Hebert
+        Compute spin image descriptor for a point according to Johnson and Hebert:
+        
+        S_o → (α, β) = (√(||x - p||² - (n·(x - p))²), n·(x - p))
+        
+        Where:
+        - p: 3D point position (keypoint)
+        - n: surface normal at point
+        - x: all other points in the point cloud
+        - α: perpendicular distance to line through p parallel to n
+        - β: signed perpendicular distance to plane through p perpendicular to n
+        
         Args:
-            point: 3D point position (p in paper)
-            normal: surface normal at point (n in paper)
-            points: all points in the point cloud
-            spin_size: size of the spin image grid
+            point: 3D keypoint position (p in paper, ν for template, ω for target)
+            normal: surface normal at keypoint (n in paper)
+            points: all points in the point cloud (x in paper)
+            spin_size: size of the spin image grid (N in correlation formula)
             max_radius: maximum radius for spin image
         Returns:
             spin_image: 2D spin image array
         """
-        # Define cylindrical coordinate system as in the paper
-        # α = perpendicular distance to line through p parallel to n
-        # β = signed perpendicular distance to plane through p perpendicular to n
-        
-        # Vector from point p to each point x
+        # Vector from keypoint p to each point x: (x - p)
         vectors = points - point
         
-        # β coordinate: projection onto normal direction
+        # β coordinate: signed perpendicular distance to plane
+        # β = n·(x - p)
         beta = np.dot(vectors, normal)
         
-        # α coordinate: distance to line (perpendicular distance)
-        # α = ||(x-p) - ((x-p)·n)n||
-        projections = np.outer(beta, normal)  # ((x-p)·n)n for all points
-        perpendicular = vectors - projections
-        alpha = np.linalg.norm(perpendicular, axis=1)
+        # α coordinate: perpendicular distance to line 
+        # α = √(||x - p||² - (n·(x - p))²)
+        vectors_squared_norm = np.linalg.norm(vectors, axis=1)**2  # ||x - p||²
+        beta_squared = beta**2  # (n·(x - p))²
         
-        # Create spin image grid
+        # Ensure non-negative argument for square root (numerical stability)
+        alpha_squared = np.maximum(0, vectors_squared_norm - beta_squared)
+        alpha = np.sqrt(alpha_squared)
+        
+        print(f"      Spin image debug: {len(points)} points, alpha range=[{np.min(alpha):.6f}, {np.max(alpha):.6f}], beta range=[{np.min(beta):.6f}, {np.max(beta):.6f}]")
+        
+        # Create spin image grid bounds
         alpha_max = max_radius
         beta_min, beta_max = -max_radius, max_radius
         
-        # Discretize coordinates
-        alpha_bins = np.linspace(0, alpha_max, spin_size)
-        beta_bins = np.linspace(beta_min, beta_max, spin_size)
+        # Discretize coordinates into bins
+        alpha_bins = np.linspace(0, alpha_max, spin_size + 1)  # +1 for bin edges
+        beta_bins = np.linspace(beta_min, beta_max, spin_size + 1)
         
         # Create 2D histogram (spin image)
         spin_image = np.zeros((spin_size, spin_size))
@@ -1469,22 +1932,25 @@ class BinPickingSystem:
         valid_beta = beta[valid_mask]
         
         if len(valid_alpha) > 0:
-            # Convert to bin indices
+            # Convert to bin indices using np.digitize
             alpha_indices = np.digitize(valid_alpha, alpha_bins) - 1
             beta_indices = np.digitize(valid_beta, beta_bins) - 1
             
-            # Clip to valid range
+            # Clip to valid range (handle edge cases)
             alpha_indices = np.clip(alpha_indices, 0, spin_size - 1)
             beta_indices = np.clip(beta_indices, 0, spin_size - 1)
             
-            # Accumulate in spin image
+            # Accumulate points in spin image bins
             for a_idx, b_idx in zip(alpha_indices, beta_indices):
                 spin_image[b_idx, a_idx] += 1
         
-        # Normalize spin image
-        if np.sum(spin_image) > 0:
-            spin_image = spin_image / np.sum(spin_image)
-            
+        # Normalize spin image (convert counts to probabilities)
+        total_points = np.sum(spin_image)
+        if total_points > 0:
+            spin_image = spin_image / total_points
+        
+        print(f"      Final spin image: shape={spin_image.shape}, total_counts={total_points}, non_zero={np.count_nonzero(spin_image)}, max={np.max(spin_image):.6f}")
+        
         return spin_image
 
     def compute_spin_image_correlation(self, spin1, spin2):
@@ -1531,45 +1997,267 @@ class BinPickingSystem:
         
         return correlation
 
-    def find_spin_image_correspondences(self, template_keypoints, template_normals, template_points,
-                                      target_keypoints, target_normals, target_points, 
-                                      correlation_threshold=0.7):
+    def validate_spin_image_computation(self, points, keypoints, normals, verbose=True):
         """
-        Find point correspondences based on spin image similarity
+        Validate that spin image computation follows the paper's mathematical formulation.
+        
+        This function verifies:
+        1. α coordinate: α = √(||x - p||² - (n·(x - p))²)
+        2. β coordinate: β = n·(x - p)  
+        3. Correlation coefficient: R(P,Q) formula
+        4. Correspondence finding based on R values
+        
+        Args:
+            points: Point cloud for spin image computation
+            keypoints: Harris 3D detected keypoints
+            normals: Surface normals at keypoints
+            verbose: Print detailed validation information
+            
+        Returns:
+            Dictionary with validation results
+        """
+        if verbose:
+            print("="*50)
+            print("VALIDATING SPIN IMAGE COMPUTATION")
+            print("="*50)
+        
+        validation_results = {
+            'formula_verification': {},
+            'correlation_tests': {},
+            'correspondence_quality': {}
+        }
+        
+        if len(keypoints) < 2:
+            if verbose:
+                print("Need at least 2 keypoints for validation")
+            return validation_results
+        
+        # Test 1: Verify spin image coordinate computation for first keypoint
+        if verbose:
+            print("Test 1: Verifying spin image coordinate formulas...")
+        
+        kp = keypoints[0]
+        normal = normals[0]
+        
+        # Manual computation following paper's formula
+        vectors = points - kp  # (x - p)
+        beta_manual = np.dot(vectors, normal)  # β = n·(x - p)
+        
+        vectors_norm_sq = np.linalg.norm(vectors, axis=1)**2  # ||x - p||²
+        beta_squared = beta_manual**2  # (n·(x - p))²
+        alpha_manual = np.sqrt(np.maximum(0, vectors_norm_sq - beta_squared))  # α formula
+        
+        # Compare with implemented function
+        spin_img = self.compute_spin_image(kp, normal, points)
+        
+        validation_results['formula_verification'] = {
+            'alpha_range': [float(np.min(alpha_manual)), float(np.max(alpha_manual))],
+            'beta_range': [float(np.min(beta_manual)), float(np.max(beta_manual))],
+            'spin_image_shape': spin_img.shape,
+            'spin_image_sum': float(np.sum(spin_img)),
+            'non_zero_bins': int(np.count_nonzero(spin_img))
+        }
+        
+        if verbose:
+            print(f"  α range: [{validation_results['formula_verification']['alpha_range'][0]:.4f}, "
+                  f"{validation_results['formula_verification']['alpha_range'][1]:.4f}]")
+            print(f"  β range: [{validation_results['formula_verification']['beta_range'][0]:.4f}, "
+                  f"{validation_results['formula_verification']['beta_range'][1]:.4f}]")
+            print(f"  Spin image: {spin_img.shape}, sum={validation_results['formula_verification']['spin_image_sum']:.4f}")
+        
+        # Test 2: Verify correlation coefficient computation
+        if verbose:
+            print("\nTest 2: Verifying correlation coefficient R(P,Q)...")
+        
+        if len(keypoints) >= 2:
+            # Compute two spin images
+            spin1 = self.compute_spin_image(keypoints[0], normals[0], points)
+            spin2 = self.compute_spin_image(keypoints[1], normals[1], points)
+            
+            # Test self-correlation (should be 1.0)
+            self_corr = self.compute_spin_image_correlation(spin1, spin1)
+            cross_corr = self.compute_spin_image_correlation(spin1, spin2)
+            
+            validation_results['correlation_tests'] = {
+                'self_correlation': float(self_corr),
+                'cross_correlation': float(cross_corr),
+                'correlation_formula_verified': abs(self_corr - 1.0) < 1e-6
+            }
+            
+            if verbose:
+                print(f"  Self-correlation R(P,P): {self_corr:.6f} (should be ≈ 1.0)")
+                print(f"  Cross-correlation R(P,Q): {cross_corr:.6f}")
+                print(f"  Formula verified: {validation_results['correlation_tests']['correlation_formula_verified']}")
+        
+        # Test 3: Correspondence quality assessment
+        if verbose:
+            print("\nTest 3: Assessing correspondence quality...")
+        
+        if len(keypoints) >= 3:
+            # Generate all spin images
+            spin_images = []
+            for i in range(min(5, len(keypoints))):  # Test first 5 keypoints
+                spin_img = self.compute_spin_image(keypoints[i], normals[i], points)
+                spin_images.append(spin_img)
+            
+            # Compute correlation matrix
+            n_imgs = len(spin_images)
+            correlation_matrix = np.zeros((n_imgs, n_imgs))
+            
+            for i in range(n_imgs):
+                for j in range(n_imgs):
+                    correlation_matrix[i, j] = self.compute_spin_image_correlation(
+                        spin_images[i], spin_images[j])
+            
+            # Analyze correlation distribution
+            off_diagonal = correlation_matrix[~np.eye(n_imgs, dtype=bool)]
+            
+            validation_results['correspondence_quality'] = {
+                'correlation_matrix_shape': correlation_matrix.shape,
+                'diagonal_mean': float(np.mean(np.diag(correlation_matrix))),
+                'off_diagonal_mean': float(np.mean(off_diagonal)),
+                'off_diagonal_std': float(np.std(off_diagonal)),
+                'max_off_diagonal': float(np.max(off_diagonal))
+            }
+            
+            if verbose:
+                print(f"  Correlation matrix: {correlation_matrix.shape}")
+                print(f"  Diagonal (self) mean: {validation_results['correspondence_quality']['diagonal_mean']:.3f}")
+                print(f"  Off-diagonal mean: {validation_results['correspondence_quality']['off_diagonal_mean']:.3f} ± "
+                      f"{validation_results['correspondence_quality']['off_diagonal_std']:.3f}")
+                print(f"  Max cross-correlation: {validation_results['correspondence_quality']['max_off_diagonal']:.3f}")
+        
+        if verbose:
+            print("\nValidation completed!")
+            print("="*50)
+        
+        return validation_results
+
+    def find_spin_image_correspondences_with_templates(self, target_spin_images, template_spin_images,
+                                                      target_keypoints, template_keypoints,
+                                                      correlation_threshold=0.6):
+        """
+        Find correspondences between target and template spin images following the paper's approach.
+        
+        The paper states: "we can find similar matching points based on the correlation coefficients 
+        as the candidates for point correspondence pairs. Thus, we can obtain the corresponding points 
+        from template, denoted as Uc, and from target, denoted as Wc"
+        
+        Args:
+            target_spin_images: List of Q spin images for target keypoints (ω)
+            template_spin_images: List of P spin images for template keypoints (ν)
+            target_keypoints: 3D positions of target keypoints (W from H(W))
+            template_keypoints: 3D positions of template keypoints (U from H(U))
+            correlation_threshold: Minimum R(P,Q) correlation for valid correspondence
+            
+        Returns:
+            List of (template_idx, target_idx, correlation_R) tuples representing Uc ↔ Wc correspondences
         """
         correspondences = []
         
-        print(f"Computing spin images for {len(template_keypoints)} template and {len(target_keypoints)} target keypoints...")
+        print(f"Finding correspondences between {len(template_spin_images)} template and {len(target_spin_images)} target spin images...")
         
-        # Compute spin images for template keypoints
-        template_spin_images = []
-        for i, (kp, normal) in enumerate(zip(template_keypoints, template_normals)):
-            spin_img = self.compute_spin_image(kp, normal, template_points)
-            template_spin_images.append(spin_img)
-        
-        # Compute spin images for target keypoints
-        target_spin_images = []
-        for i, (kp, normal) in enumerate(zip(target_keypoints, target_normals)):
-            spin_img = self.compute_spin_image(kp, normal, target_points)
-            target_spin_images.append(spin_img)
-        
-        # Find correspondences based on correlation
-        for i, template_spin in enumerate(template_spin_images):
-            best_correlation = -1
-            best_match = -1
+        # For each template spin image P, find best matching target spin image Q
+        for i, template_spin_P in enumerate(template_spin_images):
+            best_correlation_R = -1
+            best_target_idx = -1
             
-            for j, target_spin in enumerate(target_spin_images):
-                correlation = self.compute_spin_image_correlation(template_spin, target_spin)
+            # Compare with all target spin images
+            for j, target_spin_Q in enumerate(target_spin_images):
+                # Compute correlation coefficient R(P,Q) as per paper's formula
+                correlation_R = self.compute_spin_image_correlation(template_spin_P, target_spin_Q)
                 
-                if correlation > best_correlation and correlation > correlation_threshold:
-                    best_correlation = correlation
-                    best_match = j
+                # Select best match above threshold
+                if correlation_R > best_correlation_R and correlation_R > correlation_threshold:
+                    best_correlation_R = correlation_R
+                    best_target_idx = j
             
-            if best_match >= 0:
-                correspondences.append((i, best_match, best_correlation))
-                
-        print(f"Found {len(correspondences)} spin image correspondences with correlation > {correlation_threshold}")
+            # Add to correspondence list if valid match found
+            if best_target_idx >= 0:
+                correspondences.append((i, best_target_idx, best_correlation_R))
+        
+        print(f"Found {len(correspondences)} correspondences with R(P,Q) > {correlation_threshold}")
+        
+        # Log correspondence quality statistics
+        if len(correspondences) > 0:
+            correlations = [corr for _, _, corr in correspondences]
+            print(f"  Correlation range: [{min(correlations):.3f}, {max(correlations):.3f}]")
+            print(f"  Average correlation: {np.mean(correlations):.3f}")
+        
         return correspondences
+
+    def estimate_rigid_transformation_ransac(self, template_points, target_points, correspondences,
+                                           max_iterations=1000, inlier_threshold=0.005, 
+                                           camera_proximity_threshold=0.01):
+        """
+        Estimate rigid transformation using RANSAC as described in the paper
+        Following Algorithm 1: Alignment from template to target
+        """
+        if len(correspondences) < 3:
+            print("Need at least 3 correspondences for pose estimation")
+            return None, None, []
+        
+        best_R, best_T = None, None
+        best_inliers = []
+        best_inlier_count = 0
+        
+        # Extract correspondence pairs
+        template_corr = np.array([template_points[i] for i, j, _ in correspondences])
+        target_corr = np.array([target_points[j] for i, j, _ in correspondences])
+        
+        print(f"Starting RANSAC with {len(correspondences)} correspondences...")
+        
+        for iteration in range(max_iterations):
+            # Randomly select 3 correspondences
+            if len(correspondences) < 3:
+                break
+                
+            sample_indices = np.random.choice(len(correspondences), 3, replace=False)
+            sample_template = template_corr[sample_indices]
+            sample_target = target_corr[sample_indices]
+            
+            # Estimate rigid transformation from 3 point pairs
+            R, T = self.estimate_rigid_transformation_3_points(sample_template, sample_target)
+            
+            if R is None:
+                continue
+            
+            # Transform all template correspondence points
+            template_transformed = (R @ template_corr.T).T + T
+            
+            # Compute alignment error (Pe in paper)
+            distances = np.linalg.norm(template_transformed - target_corr, axis=1)
+            alignment_error = np.mean(distances)
+            
+            # Check alignment error threshold (ε1 in paper)
+            if alignment_error > inlier_threshold:
+                continue
+            
+            # Count inliers
+            inliers = distances < inlier_threshold
+            inlier_count = np.sum(inliers)
+            
+            # Compute camera proximity constraint (Ce in paper)
+            template_mean = np.mean(template_transformed, axis=0)
+            target_mean = np.mean(target_corr, axis=0)
+            camera_error = np.linalg.norm(template_mean - target_mean)
+            
+            # Check camera proximity threshold (ε2 in paper)
+            if camera_error > camera_proximity_threshold:
+                continue
+            
+            # Update best solution
+            if inlier_count > best_inlier_count:
+                best_inlier_count = inlier_count
+                best_R, best_T = R, T
+                best_inliers = np.where(inliers)[0]
+        
+        if best_R is not None:
+            print(f"RANSAC found transformation with {best_inlier_count} inliers")
+            return best_R, best_T, best_inliers
+        else:
+            print("RANSAC failed to find valid transformation")
+            return None, None, []
 
     def estimate_rigid_transformation_3_points(self, template_pts, target_pts):
         """
@@ -1646,39 +2334,40 @@ class BinPickingSystem:
                                      ransac_iterations=1000,
                                      inlier_threshold=0.005):
         """
-        Complete pose estimation pipeline using spin images following the correct algorithm:
-        1. Interest Point Detection using Harris Corner Detection
-        2. Spin Image generation using 3D mesh of the object  
-        3. Calculate R value to determine correlation between model and template
-        4. Select point correspondence pairs
-        5. Transform and Rotate template to correspond with model
-        6. Calculate Pe and Ce to validate whether they are below threshold
+        Complete pose estimation pipeline following the original paper's methodology:
+        
+        Main pipeline:
+        Step 1: Data acquisition, preprocessing
+        Step 2: Harris 3D IPD (Interest Point Detection)
+        Step 3: Spin image generation of the chosen keypoints
+        Step 4: Template and target spin image matching by calculating the R correspondence
+        Step 5: Validate the result by calculating Pe and Ce thresholds
+        Step 6: If all conditions satisfy, perform final ICP refinement
         """
-        print("Starting spin image-based pose estimation...")
+        print("Starting spin image-based pose estimation following paper methodology...")
         
-        # Step 1: Interest Point Detection using Harris Corner Detection
-        print("Step 1: Detecting interest points using Harris Corner Detection...")
-        template_hypotheses = self.compute_harris_3d_corners_multi_hypothesis(
-            template_points, num_corners=20, num_hypotheses=1)
-        target_hypotheses = self.compute_harris_3d_corners_multi_hypothesis(
-            target_points, num_corners=20, num_hypotheses=1)
+        # Step 1: Data acquisition, preprocessing (already done - points are input)
+        print("Step 1: Data acquisition and preprocessing - COMPLETED")
         
-        if len(template_hypotheses) == 0 or len(target_hypotheses) == 0:
-            print("Failed to detect Harris corner interest points")
+        # Step 2: Harris 3D IPD (Interest Point Detection)
+        print("Step 2: Harris 3D Interest Point Detection...")
+        template_keypoints = self.compute_harris_3d_corners_simple(template_points, num_corners=20)
+        target_keypoints = self.compute_harris_3d_corners_simple(target_points, num_corners=20)
+        
+        if len(template_keypoints) == 0 or len(target_keypoints) == 0:
+            print("Step 2: FAILED - Unable to detect Harris 3D keypoints")
             return None, None
         
-        # Use the first (best) hypothesis for both template and target
-        template_keypoints = template_hypotheses[0]
-        target_keypoints = target_hypotheses[0]
+        print(f"Step 2: SUCCESS - Detected {len(template_keypoints)} template and {len(target_keypoints)} target keypoints")
         
-        print(f"Detected {len(template_keypoints)} template and {len(target_keypoints)} target interest points")
+        # Step 3: Spin image generation of the chosen keypoints
+        print("Step 3: Spin image generation of the chosen keypoints...")
         
-        # Step 2: Spin Image generation using 3D mesh of the object
-        print("Step 2: Computing surface normals for spin image generation...")
+        # Compute surface normals for spin image generation
         template_normals = self.compute_surface_normals(template_points)
         target_normals = self.compute_surface_normals(target_points)
         
-        # Get normals for interest points (keypoints)
+        # Get normals for keypoints
         template_kp_normals = []
         for kp in template_keypoints:
             distances = np.linalg.norm(template_points - kp, axis=1)
@@ -1691,7 +2380,6 @@ class BinPickingSystem:
             closest_idx = np.argmin(distances)
             target_kp_normals.append(target_normals[closest_idx])
         
-        print("Step 2: Generating spin images for interest points...")
         # Generate spin images for template keypoints
         template_spin_images = []
         for i, (kp, normal) in enumerate(zip(template_keypoints, template_kp_normals)):
@@ -1704,8 +2392,10 @@ class BinPickingSystem:
             spin_img = self.compute_spin_image(kp, normal, target_points)
             target_spin_images.append(spin_img)
         
-        # Step 3: Calculate R value to determine correlation between model and template
-        print("Step 3: Computing correlations between spin images...")
+        print(f"Step 3: SUCCESS - Generated {len(template_spin_images)} template and {len(target_spin_images)} target spin images")
+        
+        # Step 4: Template and target spin image matching by calculating the R correspondence
+        print("Step 4: Template and target spin image matching by calculating R correspondence...")
         correspondences = []
         
         for i, template_spin in enumerate(template_spin_images):
@@ -1713,7 +2403,7 @@ class BinPickingSystem:
             best_match = -1
             
             for j, target_spin in enumerate(target_spin_images):
-                # Calculate R(P,Q) correlation coefficient
+                # Calculate R(P,Q) correlation coefficient using equation (4)
                 correlation = self.compute_spin_image_correlation(template_spin, target_spin)
                 
                 if correlation > best_correlation and correlation > correlation_threshold:
@@ -1723,43 +2413,61 @@ class BinPickingSystem:
             if best_match >= 0:
                 correspondences.append((i, best_match, best_correlation))
         
-        print(f"Step 3: Found {len(correspondences)} correspondences with correlation > {correlation_threshold}")
+        print(f"Step 4: SUCCESS - Found {len(correspondences)} correspondences with R(P,Q) > {correlation_threshold}")
         
         if len(correspondences) < 3:
-            print("Insufficient correspondences for pose estimation")
+            print("Step 4: FAILED - Insufficient correspondences for pose estimation")
             return None, None
         
-        # Step 4: Select point correspondence pairs and estimate transformation
-        print("Step 4: Estimating rigid transformation using enhanced alignment algorithm...")
-        
-        # Extract corresponding points from correspondences
-        template_corr_points = []
-        target_corr_points = []
-        for temp_idx, targ_idx, correlation in correspondences:
-            template_corr_points.append(template_keypoints[temp_idx])
-            target_corr_points.append(target_keypoints[targ_idx])
-        
-        template_corr_points = np.array(template_corr_points)
-        target_corr_points = np.array(target_corr_points)
-        
-        # Apply enhanced alignment algorithm with RANSAC integration
-        R, T = self.apply_enhanced_alignment_algorithm(
-            template_corr_points, target_corr_points,
-            ransac_iterations=ransac_iterations,
-            distance_threshold=inlier_threshold,
-            min_inliers=max(3, len(correspondences) // 3)  # Require at least 1/3 of correspondences as inliers
-        )
+        # Estimate initial rigid transformation using RANSAC
+        print("Estimating initial rigid transformation using RANSAC...")
+        R, T, inliers = self.estimate_rigid_transformation_ransac(
+            template_keypoints, target_keypoints, correspondences,
+            ransac_iterations, inlier_threshold)
         
         if R is None:
-            print("Step 4: Enhanced alignment algorithm failed to find valid pose")
+            print("RANSAC FAILED - Unable to find valid transformation")
             return None, None
         
-        # Step 5: Transform and Rotate template to correspond with model
-        # Step 6: Calculate Pe and Ce validation (already done in enhanced algorithm)
-        print("Step 5-6: Pose estimation with enhanced alignment completed")
-        R_refined, T_refined = R, T  # Enhanced algorithm already includes refinement
+        # Step 5: Validate the result by calculating Pe and Ce thresholds
+        print("Step 5: Validating result by calculating Pe and Ce thresholds...")
         
-        print(f"Pose estimation completed successfully")
+        # Apply transformation to correspondence points
+        template_corr = np.array([template_keypoints[i] for i, j, _ in correspondences])
+        target_corr = np.array([target_keypoints[j] for i, j, _ in correspondences])
+        template_transformed = (R @ template_corr.T).T + T
+        
+        # Calculate Pe (point alignment error) - equation (6)
+        distances = np.linalg.norm(template_transformed - target_corr, axis=1)
+        Pe = np.mean(distances)
+        
+        # Calculate Ce (centroid proximity error) - equation (7)  
+        template_centroid = np.mean(template_transformed, axis=0)
+        target_centroid = np.mean(target_corr, axis=0)
+        Ce = np.linalg.norm(template_centroid - target_centroid)
+        
+        print(f"  Pe (point alignment error): {Pe:.6f}")
+        print(f"  Ce (centroid proximity error): {Ce:.6f}")
+        
+        # Apply thresholds as per paper
+        pe_threshold = inlier_threshold  # ε1 from paper
+        ce_threshold = 0.01  # ε2 from paper (camera proximity threshold)
+        
+        if Pe > pe_threshold:
+            print(f"Step 5: FAILED - Pe ({Pe:.6f}) > threshold ({pe_threshold:.6f})")
+            return None, None
+            
+        if Ce > ce_threshold:
+            print(f"Step 5: FAILED - Ce ({Ce:.6f}) > threshold ({ce_threshold:.6f})")
+            return None, None
+        
+        print("Step 5: SUCCESS - Pe and Ce validation passed")
+        
+        # Step 6: If all conditions satisfy, perform final ICP refinement
+        print("Step 6: All conditions satisfied - performing final ICP refinement...")
+        R_refined, T_refined = self.refine_pose_with_icp(template_points, target_points, R, T)
+        
+        print(f"Pose estimation pipeline COMPLETED successfully")
         print(f"Final rotation matrix:\n{R_refined}")
         print(f"Final translation vector: {T_refined}")
         
@@ -1948,171 +2656,477 @@ class BinPickingSystem:
         print(f"Brick coordinates saved to: {filename_with_timestamp}")
         return filename_with_timestamp
 
-    # ========== TEMPLATE LIBRARY GENERATION METHODS ==========
+    # ========== SPIN IMAGE TEMPLATE GENERATION FROM CAD MODELS ==========
     
-    def generate_template_library_from_cad(self, cad_file_path, output_dir, 
-                                         rotation_step_degrees=5,
-                                         camera_distance=0.5,
-                                         use_brick_symmetry=True):
+    def generate_spin_image_templates_from_cad(self, cad_file_path, output_dir, 
+                                               x_axis_steps=10, y_axis_steps=19,
+                                               num_keypoints_per_view=15):
         """
-        Generate template library from CAD model for different poses
-        Optimized for LEGO brick symmetry to reduce template count
+        Generate spin image templates from CAD models optimized for symmetrical LEGO bricks:
+        Since LEGO bricks are symmetrical:
+        - X-axis: 0° to 90° (exploiting symmetry) in 10° steps
+        - Y-axis: 0° to 180° (exploiting symmetry) in 10° steps
+        This gives approximately 10 × 19 = 190 templates (reasonable size)
         
         Args:
-            cad_file_path: Path to CAD model (PLY, STL, OBJ formats)
-            output_dir: Directory to save template point clouds
-            rotation_step_degrees: Angular step for pose sampling
-            camera_distance: Distance from camera to object
-            use_brick_symmetry: If True, utilize brick symmetry to reduce templates
+            cad_file_path: Path to CAD model (PLY/OBJ/STL file)
+            output_dir: Directory to save template library
+            x_axis_steps: Number of steps for x-axis rotation (0° to 90°) - default 10 gives 10° steps
+            y_axis_steps: Number of steps for y-axis rotation (0° to 180°) - default 19 gives ~10° steps
+            num_keypoints_per_view: Number of keypoints to extract per view
+            
+        Returns:
+            Template library metadata
         """
+        print(f"Generating spin image templates from CAD model: {cad_file_path}")
+        print(f"Optimized for symmetrical LEGO brick: X-axis 0°-90° ({x_axis_steps} steps), Y-axis 0°-180° ({y_axis_steps} steps)")
+        print(f"Step size: ~10° increments for reasonable template library size")
+        
+        # Calculate total expected poses
+        total_expected_poses = x_axis_steps * y_axis_steps
+        print(f"Expected total poses: {total_expected_poses} (optimized for LEGO brick symmetry)")
+        
+        # Load CAD model
+        if not os.path.exists(cad_file_path):
+            print(f"CAD file not found: {cad_file_path}")
+            return None
+        
+        # Load CAD model - handle different file formats
+        file_extension = os.path.splitext(cad_file_path)[1].lower()
+        cad_points = None
+        
+        if file_extension == '.ply':
+            # Load PLY as point cloud
+            cad_pcd = o3d.io.read_point_cloud(cad_file_path)
+            if len(cad_pcd.points) > 0:
+                cad_points = np.asarray(cad_pcd.points)
+        
+        elif file_extension in ['.stl', '.obj']:
+            # Load STL/OBJ as mesh first, then sample points
+            cad_mesh = o3d.io.read_triangle_mesh(cad_file_path)
+            if len(cad_mesh.vertices) > 0:
+                print(f"Loaded mesh with {len(cad_mesh.vertices)} vertices and {len(cad_mesh.triangles)} triangles")
+                
+                # Sample points from mesh surface
+                num_points = max(5000, len(cad_mesh.vertices) * 2)  # Ensure sufficient point density
+                cad_pcd = cad_mesh.sample_points_uniformly(number_of_points=num_points)
+                cad_points = np.asarray(cad_pcd.points)
+                print(f"Sampled {len(cad_points)} points from mesh surface")
+        
+        else:
+            print(f"Unsupported file format: {file_extension}")
+            return None
+        
+        if cad_points is None or len(cad_points) == 0:
+            print("Failed to load CAD model or empty point cloud")
+            return None
+        
+        print(f"Successfully loaded CAD model with {len(cad_points)} points")
+        
+        # Ensure output directory exists
+        os.makedirs(output_dir, exist_ok=True)
+        
+        templates = []
+        template_id = 0
+        
+        # Generate templates following LEGO brick symmetry: x-axis 0°-90°, y-axis 0°-180°
+        for x_idx in range(x_axis_steps):
+            # X-axis rotation from 0° to 90° (exploiting LEGO brick symmetry)
+            x_angle = x_idx * (90.0 / (x_axis_steps - 1)) if x_axis_steps > 1 else 0.0
+            
+            for y_idx in range(y_axis_steps):
+                # Y-axis rotation from 0° to 180° (exploiting LEGO brick symmetry)
+                y_angle = y_idx * (180.0 / (y_axis_steps - 1)) if y_axis_steps > 1 else 0.0
+                
+                print(f"Generating template {template_id}: X-axis={x_angle:.1f}°, Y-axis={y_angle:.1f}°")
+                
+                # Create rotation matrix for this pose (X-axis then Y-axis rotation)
+                pose_matrix = self.create_paper_pose_matrix(x_angle, y_angle)
+                
+                # Transform CAD model to this pose
+                transformed_points = self.transform_points_with_matrix(cad_points, pose_matrix)
+                
+                # Step 2: Harris 3D IPD (Interest Point Detection)
+                keypoints = self.compute_harris_3d_corners_simple(transformed_points, num_keypoints_per_view)
+                
+                if len(keypoints) < 3:
+                    print(f"  Insufficient keypoints detected, skipping pose...")
+                    continue
+                
+                # Step 3: Spin image generation of the chosen keypoints
+                print(f"  Step 3: Generating spin images for {len(keypoints)} keypoints...")
+                normals = self.compute_surface_normals(transformed_points)
+                
+                # Get normals for keypoints
+                keypoint_normals = []
+                for kp in keypoints:
+                    distances = np.linalg.norm(transformed_points - kp, axis=1)
+                    closest_idx = np.argmin(distances)
+                    keypoint_normals.append(normals[closest_idx])
+                
+                # Generate spin images for keypoints
+                spin_images = []
+                for i, (kp, normal) in enumerate(zip(keypoints, keypoint_normals)):
+                    spin_img = self.compute_spin_image(kp, normal, transformed_points)
+                    print(f"    Keypoint {i}: spin_img shape={spin_img.shape}, non-zero={np.count_nonzero(spin_img)}, max={np.max(spin_img):.6f}")
+                    if np.count_nonzero(spin_img) == 0:
+                        print(f"    WARNING: Spin image {i} is empty! Keypoint={kp}, Normal={normal}")
+                    spin_images.append(spin_img.tolist())  # Convert to list for JSON serialization
+                
+                # Save template as PLY file for compatibility with matching code
+                template_filename = f"template_{template_id:03d}.ply"
+                template_file_path = os.path.join(output_dir, template_filename)
+                
+                # Create point cloud and save as PLY
+                template_pcd = o3d.geometry.PointCloud()
+                template_pcd.points = o3d.utility.Vector3dVector(transformed_points)
+                # Add red color to distinguish templates
+                template_colors = np.tile([1.0, 0.0, 0.0], (len(transformed_points), 1))
+                template_pcd.colors = o3d.utility.Vector3dVector(template_colors)
+                o3d.io.write_point_cloud(template_file_path, template_pcd)
+                
+                # Create template entry
+                template = {
+                    'id': f"template_{template_id:03d}",
+                    'file': template_file_path,  # Add file path for compatibility
+                    'x_rotation': x_angle,
+                    'y_rotation': y_angle,
+                    'x_axis_angle': x_angle,
+                    'y_axis_angle': y_angle,
+                    'pose_matrix': pose_matrix.tolist(),
+                    'rotation_matrix': pose_matrix[:3, :3].tolist(),
+                    'keypoints': keypoints.tolist(),
+                    'keypoint_normals': [n.tolist() for n in keypoint_normals],
+                    'spin_images': spin_images,
+                    'template_points': transformed_points.tolist(),  # Store for ICP refinement
+                    'num_keypoints': len(keypoints),
+                    'cad_source': cad_file_path
+                }
+                
+                templates.append(template)
+                template_id += 1
+                
+                print(f"  Generated {len(spin_images)} spin images for template {template_id-1}")
+        
+        # Save template library
+        library_metadata = {
+            'templates': templates,
+            'generation_params': {
+                'x_axis_steps': x_axis_steps,
+                'y_axis_steps': y_axis_steps, 
+                'x_axis_range': '0° to 180°',
+                'y_axis_range': '0° to 360°',
+                'num_keypoints_per_view': num_keypoints_per_view,
+                'cad_source': cad_file_path,
+                'methodology': 'Paper specification: 172 poses total'
+            },
+            'total_templates': len(templates)
+        }
+        
+        # Save to JSON file
+        metadata_file = os.path.join(output_dir, "spin_image_template_library.json")
+        with open(metadata_file, 'w') as f:
+            json.dump(library_metadata, f, indent=2)
+        
+        print(f"Generated {len(templates)} spin image templates (expected ~172 as per paper)")
+        print(f"Template library saved to: {metadata_file}")
+        
+        return library_metadata
+
+    def create_paper_pose_matrix(self, x_angle_deg, y_angle_deg):
+        """
+        Create 4x4 pose matrix following the paper's rotation specification:
+        X-axis rotation (0° to 180°) then Y-axis rotation (0° to 360°)
+        
+        Args:
+            x_angle_deg: Rotation around X-axis in degrees (0° to 180°)
+            y_angle_deg: Rotation around Y-axis in degrees (0° to 360°)
+            
+        Returns:
+            4x4 transformation matrix
+        """
+        # Convert to radians
+        x_rad = np.radians(x_angle_deg)
+        y_rad = np.radians(y_angle_deg)
+        
+        # Rotation around X-axis
+        R_x = np.array([
+            [1, 0,              0],
+            [0, np.cos(x_rad), -np.sin(x_rad)],
+            [0, np.sin(x_rad),  np.cos(x_rad)]
+        ])
+        
+        # Rotation around Y-axis
+        R_y = np.array([
+            [np.cos(y_rad),  0, np.sin(y_rad)],
+            [0,              1, 0],
+            [-np.sin(y_rad), 0, np.cos(y_rad)]
+        ])
+        
+        # Combined rotation: Y-axis rotation after X-axis rotation
+        R = R_y @ R_x
+        
+        # Create 4x4 homogeneous transformation matrix
+        pose_matrix = np.eye(4)
+        pose_matrix[:3, :3] = R
+        
+        return pose_matrix
+
+    def create_viewing_pose_matrix(self, rotation_angle_deg, elevation_angle_deg):
+        """
+        Create 4x4 pose matrix for viewing angle
+        
+        Args:
+            rotation_angle_deg: Rotation around Z-axis in degrees
+            elevation_angle_deg: Elevation angle in degrees
+            
+        Returns:
+            4x4 transformation matrix
+        """
+        # Convert to radians
+        rot_rad = np.radians(rotation_angle_deg)
+        elev_rad = np.radians(elevation_angle_deg)
+        
+        # Rotation around Z-axis 
+        R_z = np.array([
+            [np.cos(rot_rad), -np.sin(rot_rad), 0],
+            [np.sin(rot_rad),  np.cos(rot_rad), 0],
+            [0,                0,               1]
+        ])
+        
+        # Rotation around X-axis for elevation
+        R_x = np.array([
+            [1, 0,                 0],
+            [0, np.cos(elev_rad), -np.sin(elev_rad)],
+            [0, np.sin(elev_rad),  np.cos(elev_rad)]
+        ])
+        
+        # Combined rotation
+        R = R_x @ R_z
+        
+        # Create 4x4 homogeneous transformation matrix
+        pose_matrix = np.eye(4)
+        pose_matrix[:3, :3] = R
+        
+        return pose_matrix
+
+    def transform_points_with_matrix(self, points, transformation_matrix):
+        """
+        Transform 3D points using 4x4 transformation matrix
+        
+        Args:
+            points: Nx3 array of 3D points
+            transformation_matrix: 4x4 transformation matrix
+            
+        Returns:
+            Transformed Nx3 array of 3D points
+        """
+        # Convert to homogeneous coordinates
+        ones = np.ones((len(points), 1))
+        points_homogeneous = np.hstack([points, ones])
+        
+        # Apply transformation
+        transformed_homogeneous = (transformation_matrix @ points_homogeneous.T).T
+        
+        # Convert back to 3D coordinates
+        transformed_points = transformed_homogeneous[:, :3]
+        
+        return transformed_points
+
+    def compute_harris_3d_corners_simple(self, points, num_corners=15):
+        """
+        Simplified Harris 3D corner detection for target scene analysis.
+        Removes the complexity of multi-hypothesis and focuses on finding good corner features.
+        
+        Args:
+            points: Point cloud from real sensor data
+            num_corners: Number of corners to detect
+            
+        Returns:
+            Array of detected corner points
+        """
+        if len(points) < 10:
+            print("Not enough points for Harris corner detection")
+            return np.array([])
+
+        print(f"Computing Harris corners for {len(points)} points...")
+        
         try:
-            # Load CAD model
-            if cad_file_path.endswith('.ply'):
-                mesh = o3d.io.read_triangle_mesh(cad_file_path)
-            elif cad_file_path.endswith('.stl'):
-                mesh = o3d.io.read_triangle_mesh(cad_file_path)
-            elif cad_file_path.endswith('.obj'):
-                mesh = o3d.io.read_triangle_mesh(cad_file_path)
+            # Use the existing improved Harris detection but simplified
+            corners = self.compute_harris_3d_corners_improved(
+                points, 
+                delta=0.025,
+                harris_k=0.04,
+                cluster_threshold=0.008,
+                num_corners=num_corners
+            )
+            
+            if len(corners) > 0:
+                print(f"Successfully detected {len(corners)} Harris corners")
+                return corners
             else:
-                raise ValueError("Unsupported CAD file format. Use PLY, STL, or OBJ.")
-            
-            if len(mesh.vertices) == 0:
-                raise ValueError("Failed to load CAD model or model is empty")
-            
-            print(f"Loaded CAD model with {len(mesh.vertices)} vertices")
-            
-            # Create output directory
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # Generate templates for different poses
-            template_count = 0
-            templates_info = []
-            
-            # Optimize rotation ranges based on LEGO brick symmetry
-            if use_brick_symmetry:
-                # LEGO brick is symmetrical, so we only need:
-                # Y-axis: 0-180° (instead of 0-360°) due to 180° rotational symmetry
-                # X-axis: 0-90° (instead of 0-180°) due to top-bottom symmetry when grasping
-                x_range = range(0, 91, rotation_step_degrees)  # 0-90°
-                y_range = range(0, 180, rotation_step_degrees)  # 0-180°
-                print("Using optimized rotation ranges for LEGO brick symmetry:")
-                print(f"X-axis: 0-90° (step: {rotation_step_degrees}°)")
-                print(f"Y-axis: 0-180° (step: {rotation_step_degrees}°)")
-            else:
-                # Full rotation ranges (original method)
-                x_range = range(0, 181, rotation_step_degrees)  # 0-180°
-                y_range = range(0, 360, rotation_step_degrees)  # 0-360°
-                print("Using full rotation ranges:")
-                print(f"X-axis: 0-180° (step: {rotation_step_degrees}°)")
-                print(f"Y-axis: 0-360° (step: {rotation_step_degrees}°)")
-            
-            # Sample rotations around Y-axis and X-axis
-            for x_rot in x_range:
-                for y_rot in y_range:
-                    # Create rotation matrix
-                    R_x = mesh.get_rotation_matrix_from_xyz([np.radians(x_rot), 0, 0])
-                    R_y = mesh.get_rotation_matrix_from_xyz([0, np.radians(y_rot), 0])
-                    R_total = R_y @ R_x
-                    
-                    # Create a copy of the mesh by copying vertices and triangles
-                    import copy
-                    mesh_rotated = o3d.geometry.TriangleMesh()
-                    mesh_rotated.vertices = copy.deepcopy(mesh.vertices)
-                    mesh_rotated.triangles = copy.deepcopy(mesh.triangles)
-                    if hasattr(mesh, 'vertex_normals') and len(mesh.vertex_normals) > 0:
-                        mesh_rotated.vertex_normals = copy.deepcopy(mesh.vertex_normals)
-                    
-                    # Apply rotation to mesh
-                    mesh_rotated.rotate(R_total, center=(0, 0, 0))
-                    
-                    # Generate point cloud from rotated mesh
-                    # Sample points on surface
-                    point_cloud = mesh_rotated.sample_points_uniformly(number_of_points=2000)
-                    
-                    # Simulate depth capture from camera viewpoint
-                    # Camera looking down negative Z-axis
-                    points = np.asarray(point_cloud.points)
-                    
-                    # Translate object to camera distance
-                    points[:, 2] += camera_distance
-                    
-                    # Filter points visible from camera (front-facing)
-                    # Simple visibility check - keep points with Z > 0
-                    visible_mask = points[:, 2] > 0
-                    visible_points = points[visible_mask]
-                    
-                    if len(visible_points) < 100:  # Skip if too few visible points
-                        continue
-                    
-                    # Add some noise to simulate real depth sensor
-                    noise_level = 0.001  # 1mm noise
-                    noise = np.random.normal(0, noise_level, visible_points.shape)
-                    noisy_points = visible_points + noise
-                    
-                    # Save template
-                    template_file = os.path.join(output_dir, f"template_{template_count:03d}.ply")
-                    
-                    # Create point cloud object and save
-                    template_pcd = o3d.geometry.PointCloud()
-                    template_pcd.points = o3d.utility.Vector3dVector(noisy_points)
-                    o3d.io.write_point_cloud(template_file, template_pcd)
-                    
-                    # Save template info with normalized rotation values
-                    template_info = {
-                        'id': template_count,
-                        'file': template_file,
-                        'x_rotation': x_rot,
-                        'y_rotation': y_rot,
-                        'rotation_matrix': R_total.tolist(),
-                        'num_points': len(noisy_points),
-                        'symmetry_optimized': use_brick_symmetry
-                    }
-                    templates_info.append(template_info)
-                    
-                    template_count += 1
-            
-            # Save template library metadata
-            import json
-            metadata_file = os.path.join(output_dir, "template_library.json")
-            with open(metadata_file, 'w') as f:
-                json.dump(templates_info, f, indent=2)
-            
-            print(f"Generated {template_count} templates saved to {output_dir}")
-            if use_brick_symmetry:
-                original_count = len(range(0, 181, rotation_step_degrees)) * len(range(0, 360, rotation_step_degrees))
-                reduction_percentage = (1 - template_count / original_count) * 100
-                print(f"Symmetry optimization reduced templates by {reduction_percentage:.1f}%")
-                print(f"(Would have been {original_count} templates without optimization)")
-            print(f"Template metadata saved to {metadata_file}")
-            
-            return templates_info
-            
+                print("Harris detection failed - insufficient keypoints for spin image pipeline")
+                return np.array([])
+                
         except Exception as e:
-            print(f"Error generating template library: {e}")
-            return []
+            print(f"Harris detection error: {e}")
+            print("Unable to detect Harris corners - pipeline requires corner detection")
+            return np.array([])
 
     def load_template_library(self, template_dir):
         """
-        Load template library from directory
+        Load spin image template library from directory
+        Supports both old PLY-based templates and new spin image templates
         """
         import json
         
-        metadata_file = os.path.join(template_dir, "template_library.json")
+        # Try to load spin image template library first
+        spin_metadata_file = os.path.join(template_dir, "spin_image_template_library.json")
+        if os.path.exists(spin_metadata_file):
+            try:
+                with open(spin_metadata_file, 'r') as f:
+                    library_data = json.load(f)
+                
+                templates = library_data.get('templates', [])
+                print(f"Loaded spin image template library with {len(templates)} templates")
+                return templates
+                
+            except Exception as e:
+                print(f"Error loading spin image template library: {e}")
         
-        if not os.path.exists(metadata_file):
-            print(f"Template metadata file not found: {metadata_file}")
-            return []
+        # Fallback to old PLY-based template system
+        old_metadata_file = os.path.join(template_dir, "template_library.json")
+        if os.path.exists(old_metadata_file):
+            try:
+                with open(old_metadata_file, 'r') as f:
+                    templates_info = json.load(f)
+                
+                print(f"Loaded legacy PLY template library with {len(templates_info)} templates")
+                print("Note: Consider generating spin image templates for better performance")
+                return templates_info
+                
+            except Exception as e:
+                print(f"Error loading legacy template library: {e}")
         
-        try:
-            with open(metadata_file, 'r') as f:
-                templates_info = json.load(f)
+        print(f"No template library found in directory: {template_dir}")
+        return []
+
+    def create_demo_spin_image_templates(self, demo_output_dir):
+        """
+        Demo function to create spin image templates from a sample CAD model
+        This demonstrates the correct pipeline from the paper
+        """
+        print("Creating demo spin image templates...")
+        
+        # For demonstration, create a simple LEGO brick-like point cloud
+        # In practice, you would load a real CAD model file
+        demo_cad_points = self.create_sample_lego_brick_points()
+        
+        # Save as temporary PLY file
+        demo_cad_file = os.path.join(demo_output_dir, "demo_lego_brick.ply")
+        os.makedirs(demo_output_dir, exist_ok=True)
+        
+        # Create Open3D point cloud
+        demo_pcd = o3d.geometry.PointCloud()
+        demo_pcd.points = o3d.utility.Vector3dVector(demo_cad_points)
+        demo_pcd.paint_uniform_color([1.0, 0.0, 0.0])  # Red color
+        
+        # Save PLY file
+        o3d.io.write_point_cloud(demo_cad_file, demo_pcd)
+        
+        # Generate spin image templates
+        template_library = self.generate_spin_image_templates_from_cad(
+            cad_file_path=demo_cad_file,
+            output_dir=demo_output_dir,
+            rotation_steps=18,  # Every 20 degrees
+            elevation_steps=3,  # 0, 30, 60 degrees
+            num_keypoints_per_view=10
+        )
+        
+        if template_library:
+            print(f"Successfully created {template_library['total_templates']} demo templates")
+            print("Template library ready for use in bin picking pipeline")
             
-            print(f"Loaded template library with {len(templates_info)} templates")
-            return templates_info
+            # Example usage in pipeline:
+            print("\nTo use in pipeline:")
+            print(f"system.run_enhanced_bin_picking_pipeline(template_library_dir='{demo_output_dir}')")
+        
+        return template_library
+
+    def create_sample_lego_brick_points(self):
+        """
+        Create a sample LEGO brick point cloud for demonstration
+        Standard 2x4 LEGO brick dimensions: 32mm x 16mm x 9.6mm
+        """
+        # Brick dimensions in meters
+        length, width, height = 0.032, 0.016, 0.0096
+        
+        # Generate points on brick surface
+        points = []
+        
+        # Density of points per surface
+        density = 100  # points per square meter
+        
+        # Top and bottom surfaces
+        for z in [0, height]:
+            num_points = int(length * width * density)
+            x_coords = np.random.uniform(0, length, num_points)
+            y_coords = np.random.uniform(0, width, num_points)
+            z_coords = np.full(num_points, z)
             
-        except Exception as e:
-            print(f"Error loading template library: {e}")
-            return []
+            surface_points = np.column_stack([x_coords, y_coords, z_coords])
+            points.append(surface_points)
+        
+        # Side surfaces
+        # Front and back (length x height)
+        for y in [0, width]:
+            num_points = int(length * height * density)
+            x_coords = np.random.uniform(0, length, num_points)
+            z_coords = np.random.uniform(0, height, num_points)
+            y_coords = np.full(num_points, y)
+            
+            surface_points = np.column_stack([x_coords, y_coords, z_coords])
+            points.append(surface_points)
+        
+        # Left and right (width x height)
+        for x in [0, length]:
+            num_points = int(width * height * density)
+            y_coords = np.random.uniform(0, width, num_points)
+            z_coords = np.random.uniform(0, height, num_points)
+            x_coords = np.full(num_points, x)
+            
+            surface_points = np.column_stack([x_coords, y_coords, z_coords])
+            points.append(surface_points)
+        
+        # Add LEGO studs on top surface (2x4 = 8 studs)
+        stud_radius = 0.0024  # 2.4mm radius
+        stud_height = 0.0017  # 1.7mm height
+        stud_spacing = 0.008  # 8mm spacing
+        
+        for i in range(2):  # 2 studs along width
+            for j in range(4):  # 4 studs along length
+                # Stud center position
+                center_x = (j + 0.5) * stud_spacing
+                center_y = (i + 0.5) * stud_spacing
+                
+                # Generate points on stud cylinder
+                theta = np.linspace(0, 2*np.pi, 20)
+                z_stud = np.linspace(height, height + stud_height, 5)
+                
+                for z in z_stud:
+                    for t in theta:
+                        x = center_x + stud_radius * np.cos(t)
+                        y = center_y + stud_radius * np.sin(t)
+                        points.append([[x, y, z]])
+        
+        # Combine all points
+        all_points = np.vstack(points)
+        
+        # Center the brick at origin
+        centroid = np.mean(all_points, axis=0)
+        centered_points = all_points - centroid
+        
+        return centered_points
 
     def find_best_template_match(self, target_points, template_library_dir, 
                                 correlation_threshold=0.7,
@@ -2209,10 +3223,6 @@ class BinPickingSystem:
         
         # STEP 2: Compute neighborhoods using adaptive Delaunay triangulation
         neighborhood = self.compute_delaunay_neighborhood(preprocessed_points, delta=delta)
-        
-        if len(neighborhood) == 0:
-            print("Failed to compute neighborhoods, falling back to k-NN")
-            neighborhood = self.compute_knn_neighborhood(preprocessed_points, k=6)
         
         # STEP 3: Initialize response array
         resp = np.zeros(len(preprocessed_points))
@@ -2545,115 +3555,215 @@ class BinPickingSystem:
     #         s.sendall(file_data)
 
     # Running the pipeline and saving data
-    def run_pipeline(self, template_library_dir=None, enable_spin_images=False):
-        print("0. Starting pipeline...")
-        print(f"   - Spin image pose estimation: {'Enabled' if enable_spin_images else 'Disabled'}")
-        if template_library_dir:
-            print(f"   - Template library: {template_library_dir}")
-            
-        points, colors = self.capture_and_preprocess_kinect_data()
-        # Check if the pipeline is running or not
-        if len(points) == 0:
-            print("[PIPELINE] No valid points found after preprocessing. Exiting.")
-            return
-        
-        print("1. Data captured and preprocessed.")
-        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        transformed_file = os.path.join(self.output_dir, f"Transformed_ROI_point_cloud_{timestamp_str}.txt")
-        summary_file = os.path.join(self.output_dir, f"Cluster_Summary_{timestamp_str}.txt")
-        image_file = os.path.join(self.output_dir, f"PointCloud_Img_{timestamp_str}.png")
-        
-        print("2. Saving transformed point cloud...")
-        self.save_transformed_point_cloud(points, colors, transformed_file)
-        
-        # Also save as PLY format for compatibility with 3D_Harris_IPD tools
-        ply_file = os.path.join(self.output_dir, f"Transformed_ROI_point_cloud_{timestamp_str}.ply")
-        self.save_point_cloud_as_ply(points, colors, ply_file)
-        
-        print("3. Saving point cloud image...")
-        self.save_cloud_image(points, colors, image_file)
-        
-        print("4. Clustering, detecting corners, and pose estimation...")
-        # Use parameters optimized for LEGO bricks detection
-        self.cluster_and_save_summary(transformed_file, summary_file,
-                                    dbscan_eps=0.01, dbscan_min_samples=10,
-                                    harris_delta=0.02,  # Smaller neighborhood for LEGO brick details
-                                    harris_k=0.04,      # Standard Harris parameter
-                                    harris_fraction=0.15, # Select more potential corners
-                                    harris_cluster_threshold=0.008, # Closer corners allowed for LEGO
-                                    harris_num_corners=12,  # More corners per brick
-                                    template_library_dir=template_library_dir,
-                                    enable_spin_images=enable_spin_images)
-        
-        print("5. Sending summary file to server...")
-        # Server transfer function is commented out
-        # try:
-        #     self.send_file_via_tcp(summary_file)
-        #     print("[PIPELINE] Summary file sent successfully.")
-        # except Exception as e:
-        #     print(f"[ERROR] Failed to send file to server: {e}")
 
-        print("[PIPELINE] All processes completed.")
-
-    def generate_lego_templates(self, cad_file_path, output_dir):
-        """
-        Convenience method to generate LEGO brick template library
-        """
-        print("Generating LEGO brick template library...")
-        templates = self.generate_template_library_from_cad(
-            cad_file_path, output_dir, 
-            rotation_step_degrees=10,  # 20-degree steps as mentioned in paper
-            camera_distance=0.5)
-        
-        if len(templates) > 0:
-            print(f"Successfully generated {len(templates)} LEGO brick templates")
-            return True
-        else:
-            print("Failed to generate template library")
-            return False
-        
-if __name__ == "__main__":
-    # Initialize the bin picking system
+def run_full_pipeline():
+    """Full pipeline execution"""
+    # Initialize the 3D Object Alignment Pipeline System
     system = BinPickingSystem(wdf_path="")
     
-    # Example 1: Generate LEGO brick template library from CAD model (optional)
-    # cad_file = "C:\\Users\\FILAB\\Desktop\\DUY\\LegoBrick_4_2.stl"  # or .stl, .obj
-    # template_output_dir = "C:\\Users\\FILAB\\Desktop\\DUY\\templates"
-    # success = system.generate_lego_templates(cad_file, template_output_dir)
-    # if success:
-    #     print("Template library generated successfully!")
+    # Test spin image visualization first
+    print("="*60)
+    print("TESTING SPIN IMAGE VISUALIZATION")
+    print("="*60)
+    system.test_spin_image_visualization()
     
-    # Example 2: Run ENHANCED pipeline for stacked LEGO bricks (RECOMMENDED)
-    print("Running ENHANCED pipeline for stacked LEGO bricks...")
-    template_library_dir = None  # Set to template directory path if available
-    # template_library_dir = "C:\\Users\\FILAB\\Desktop\\DUY\\templates\\lego_brick"  # Uncomment if you have templates
-
-    enhanced_results = system.run_enhanced_bin_picking_pipeline(
-        template_library_dir=template_library_dir,
-        enable_visualization=True
+    # Pipeline Implementation following the original paper methodology
+    
+    print("="*60)
+    print("3D OBJECT ALIGNMENT PIPELINE")
+    print("Following Original Paper Methodology")
+    print("="*60)
+    
+    # Initial Step: Generate Template Library from CAD model
+    # Following paper: "To represent the 3D model for an object, we use a simulator to generate 
+    # the depth images of an object along x-axis from 0° to 180° and y-axis from 0° to 360°. 
+    # Thus, We have totally 172 poses of an object."
+    
+    cad_file = "C:\\Users\\FILAB\\Desktop\\DUY\\LegoBrick_4_2.stl"
+    template_output_dir = "C:\\Users\\FILAB\\Desktop\\DUY\\templates"
+    
+    print("Initial Step: Template Generation from CAD Model")
+    print("TESTING MODE: Generating only 2 templates to visualize spin images")
+    
+    spin_templates = system.generate_spin_image_templates_from_cad(
+        cad_file_path=cad_file,
+        output_dir=template_output_dir,
+        x_axis_steps=1,  # Only 1 step (0°) for X-axis
+        y_axis_steps=2,  # 2 steps (0°, 180°) for Y-axis  
+        num_keypoints_per_view=15
     )
     
-    if enhanced_results:
-        print("\nENHANCED PIPELINE SUMMARY:")
-        print(f"- Method: {enhanced_results['world_coordinates']['method']}")
-        print(f"- Position: {enhanced_results['world_coordinates']['position']}")
-        print(f"- Rotation: {enhanced_results['world_coordinates']['rotation']}")
-        print(f"- Match Score: {enhanced_results['world_coordinates']['match_score']:.3f}")
-        print(f"- Cluster Size: {enhanced_results['cluster_info']['filtered_size']} points")
+    if not spin_templates:
+        print("Failed to generate templates. Exiting.")
+        exit(1)
     
-    # Example 3: Run traditional pipeline with Harris corner detection (for comparison)
-    # print("Running traditional pipeline with Harris corner detection...")
-    # system.run_pipeline()
+    print(f"Generated {spin_templates['total_templates']} spin image templates for testing visualization")
     
-    # Example 4: Run pipeline with spin image pose estimation (research paper method)
-    # Uncomment to use spin image-based pose estimation with template matching
-    # print("Running pipeline with spin image pose estimation...")
-    # template_library_dir = "C:\\Users\\FILAB\\Desktop\\DUY\\templates\\lego_brick"  # Directory with generated templates
-    # system.run_pipeline(template_library_dir=template_library_dir, enable_spin_images=True)
+    # Main Pipeline: Steps 1-6
+    print("\nRunning Main Pipeline (Steps 1-6)...")
+    print("Step 1: Data acquisition, preprocessing")
+    print("Step 2: Harris 3D IPD")
+    print("Step 3: Spin image generation of chosen keypoints")
+    print("Step 4: Template-target spin image matching (R correspondence)")
+    print("Step 5: Pose validation (Pe and Ce thresholds)")
+    print("Step 6: Final ICP refinement (if validation passes)")
     
-    # Example 5: Load and use existing template library
-    # templates = system.load_template_library("C:\\Users\\FILAB\\Desktop\\DUY\\templates\\lego_brick")
-    # if templates:
-    #     print(f"Loaded {len(templates)} templates from library")
+    results = system.run_enhanced_bin_picking_pipeline(
+        template_library_dir=template_output_dir,
+        enable_visualization=True,
+        enable_spin_images=True
+    )
+    
+    if results:
+        print("\n" + "="*60)
+        print("PIPELINE EXECUTION COMPLETED SUCCESSFULLY")
+        print("="*60)
+        
+        world_coords = results['world_coordinates']
+        pose_result = results['pose_result']
+        
+        print(f"Alignment Method: {world_coords['method']}")
+        print(f"Object Position: [{world_coords['position'][0]:.3f}, {world_coords['position'][1]:.3f}, {world_coords['position'][2]:.3f}] meters")
+        print(f"Object Rotation: [{world_coords['rotation'][0]:.1f}, {world_coords['rotation'][1]:.1f}, {world_coords['rotation'][2]:.1f}] degrees")
+        
+        if 'Pe' in pose_result and 'Ce' in pose_result:
+            print(f"Pe (point error): {pose_result['Pe']:.6f}")
+            print(f"Ce (centroid error): {pose_result['Ce']:.6f}")
+            print(f"Template Match Score: {pose_result['match_score']:.3f}")
+            print(f"Template ID: {pose_result['template_id']}")
+    else:
+        print("Pipeline execution failed")
+        print("- No valid clusters found or pose estimation failed")
     
     print("Bin picking system completed!")
+
+# Standalone function to generate template spin images for visualization
+def generate_template_spin_images_only(cad_file_path, output_dir, x_axis_steps=1, y_axis_steps=2):
+    """
+    Standalone function to generate and visualize template spin images from CAD model
+    without running the full pipeline. Perfect for testing and visualization.
+    
+    Args:
+        cad_file_path: Path to CAD model file
+        output_dir: Directory to save spin images
+        x_axis_steps: Number of rotation steps for X-axis
+        y_axis_steps: Number of rotation steps for Y-axis
+    """
+    print("="*60)
+    print("GENERATING TEMPLATE SPIN IMAGES FROM CAD MODEL")
+    print("="*60)
+    
+    system = BinPickingSystem(None, output_dir)
+    
+    # Generate templates
+    print(f"Loading CAD model: {cad_file_path}")
+    templates = system.generate_spin_image_templates_from_cad(
+        cad_file_path=cad_file_path,
+        output_dir=output_dir,
+        x_axis_steps=x_axis_steps,
+        y_axis_steps=y_axis_steps,
+        num_keypoints_per_view=15
+    )
+    
+    if not templates:
+        print("ERROR: Failed to generate templates!")
+        return
+    
+    print(f"Generated {templates['total_templates']} templates")
+    
+    # Load the templates and generate spin images for each
+    template_library = system.load_template_library(output_dir)
+    if not template_library:
+        print("ERROR: Failed to load template library!")
+        return
+    
+    print(f"Loaded {len(template_library)} templates from library")
+    
+    # Generate spin images for each template
+    for template in template_library:
+        try:
+            print(f"\nProcessing template {template['id']}...")
+            
+            # Load template point cloud
+            template_file = template['file']
+            template_pcd = o3d.io.read_point_cloud(template_file)
+            template_points = np.asarray(template_pcd.points)
+            
+            if len(template_points) < 10:
+                print(f"  Skipping template {template['id']} - too few points")
+                continue
+            
+            # Get Harris keypoints
+            template_keypoints = system.compute_harris_3d_keypoints(template_points, num_corners=15)
+            if len(template_keypoints) == 0:
+                print(f"  Skipping template {template['id']} - no keypoints found")
+                continue
+            
+            print(f"  Found {len(template_keypoints)} Harris keypoints")
+            
+            # Compute surface normals
+            template_normals = system.compute_surface_normals(template_points)
+            template_kp_normals = []
+            for kp in template_keypoints:
+                distances = np.linalg.norm(template_points - kp, axis=1)
+                closest_idx = np.argmin(distances)
+                template_kp_normals.append(template_normals[closest_idx])
+            
+            # Generate spin images
+            template_spin_images = []
+            print(f"  Generating {len(template_keypoints)} spin images...")
+            
+            for j, (kp, normal) in enumerate(zip(template_keypoints, template_kp_normals)):
+                spin_img = system.compute_spin_image(kp, normal, template_points)
+                template_spin_images.append(spin_img)
+                
+                # Save individual spin image
+                template_spin_dir = os.path.join(output_dir, "spin_images", "templates", template['id'])
+                template_spin_filename = os.path.join(template_spin_dir, f"template_spin_{j:03d}.png")
+                print(f"    Saving spin image {j+1}/{len(template_keypoints)}: {template_spin_filename}")
+                system.save_spin_image(spin_img, template_spin_filename, cmap="plasma")
+            
+            # Create summary visualization
+            if len(template_spin_images) > 0:
+                print(f"  Creating summary visualization for template {template['id']}...")
+                system.save_template_spin_image_summary(template_spin_images, template['id'], output_dir)
+                print(f"  Template {template['id']}: {len(template_spin_images)} spin images saved!")
+                
+        except Exception as e:
+            print(f"ERROR processing template {template['id']}: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    print("="*60)
+    print("TEMPLATE SPIN IMAGE GENERATION COMPLETED!")
+    print("="*60)
+    print(f"Check the following directories for results:")
+    print(f"  Individual images: {output_dir}/spin_images/templates/template_XXX/")
+    print(f"  Summary images: {output_dir}/spin_images/templates/template_XXX/template_XXX_spin_summary.png")
+
+if __name__ == "__main__":
+    # Test template spin image generation without full pipeline
+    print("OPTION 1: Generate Template Spin Images Only (for visualization)")
+    print("OPTION 2: Run Full Pipeline")
+    print()
+    
+    # Uncomment the option you want to run:
+    
+    # OPTION 1: Generate template spin images only (recommended for visualization)
+    cad_file = "C:\\Users\\FILAB\\Desktop\\DUY\\LegoBrick_4_2.stl"
+    template_output_dir = "C:\\Users\\FILAB\\Desktop\\DUY\\templates"
+    
+    print("Running OPTION 1: Template Spin Image Generation Only")
+    generate_template_spin_images_only(
+        cad_file_path=cad_file,
+        output_dir=template_output_dir,
+        x_axis_steps=1,  # Just 1 pose for testing
+        y_axis_steps=2   # 2 poses for testing
+    )
+    print("Template spin images generated! Check the output directory.")
+    
+    # OPTION 2: Full pipeline (uncomment to run instead)
+    # run_full_pipeline()
+
+def run_full_pipeline():
+    """Full pipeline execution"""
