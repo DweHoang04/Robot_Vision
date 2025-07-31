@@ -98,10 +98,26 @@ python test_enhanced_pipeline.py
 
 ### Step 0: Closest Brick Cluster Filtering
 
-- **Color Filtering**: Detects valid LEGO colors (red, orange, yellow, light blue, dark blue, light green)
-- **Closest Cluster**: Finds the cluster containing points closest to the camera
-- **Dominant Color**: Extracts the dominant color from the closest points
-- **Output**: Filtered point cloud containing only the target brick
+The filtering process follows a three-stage approach to isolate the target brick:
+
+1. **Closest Cluster Detection**: 
+   - Applies DBSCAN clustering to the entire input point cloud (no color pre-filtering)
+   - Identifies the cluster containing the point closest to the camera (minimum Z-distance)
+   - Ensures the truly closest physical cluster is selected, not just the closest colored cluster
+
+2. **Reference Color Extraction**:
+   - Analyzes the N closest points within the identified cluster (default: 30% closest points)
+   - Classifies their colors using HSV-based LEGO color detection
+   - Determines the dominant color among these closest points as the "reference color"
+
+3. **Color-based Cluster Filtering**:
+   - Filters the entire closest cluster to keep only points matching the reference color
+   - Removes outlier colors and noise within the cluster
+   - Outputs a clean point cloud of the target brick with consistent color
+
+**LEGO Color Detection**: Supports red, orange, yellow, light green, light blue, and dark blue using calibrated HSV ranges with special handling for red hue wrap-around.
+
+**Output**: Clean, color-consistent point cloud containing only the target brick closest to the camera.
 
 ### Step 1: 3D Harris Keypoint Detection
 

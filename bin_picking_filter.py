@@ -77,51 +77,6 @@ class BinPickingFilter:
         
         return None
     
-    def filter_by_lego_colors(self, points, colors):
-        """
-        Filter points to keep only those with valid LEGO colors
-        
-        Args:
-            points: Point cloud (N x 3)
-            colors: RGB colors (N x 3) in [0, 1] range
-            
-        Returns:
-            filtered_points: Points with valid LEGO colors
-            filtered_colors: Corresponding colors
-            color_labels: Color classification for each point
-        """
-        print(f"Filtering {len(points)} points by LEGO colors...")
-        
-        # Convert RGB to HSV
-        hsv_colors = self.rgb_to_hsv_vectorized(colors)
-        
-        # Classify each color
-        valid_mask = []
-        color_labels = []
-        
-        for hsv_color in hsv_colors:
-            color_class = self.classify_lego_color(hsv_color)
-            if color_class is not None:
-                valid_mask.append(True)
-                color_labels.append(color_class)
-            else:
-                valid_mask.append(False)
-                color_labels.append('unknown')
-        
-        valid_mask = np.array(valid_mask)
-        
-        # Filter points and colors
-        filtered_points = points[valid_mask]
-        filtered_colors = colors[valid_mask]
-        filtered_color_labels = [label for i, label in enumerate(color_labels) if valid_mask[i]]
-        
-        print(f"Kept {len(filtered_points)} points with valid LEGO colors")
-        if len(filtered_color_labels) > 0:
-            color_counts = Counter(filtered_color_labels)
-            print(f"Color distribution: {dict(color_counts)}")
-        
-        return filtered_points, filtered_colors, filtered_color_labels
-    
     def find_closest_cluster(self, points, colors, eps=0.01, min_samples=10):
         """
         Find the cluster containing the closest points to the camera
@@ -206,26 +161,22 @@ class BinPickingFilter:
         
         return closest_cluster_points, closest_cluster_colors, cluster_info
     
-    def extract_dominant_color_region(self, points, colors, color_labels=None, 
-                                    top_points_ratio=0.3):
+    def get_reference_color_from_closest_points(self, points, colors, top_points_ratio=0.3):
         """
-        Extract the dominant color from the closest points in the cluster
+        Extract reference color from the closest points to the camera in the cluster
         
         Args:
             points: Cluster points (N x 3)
             colors: Cluster colors (N x 3)
-            color_labels: Pre-classified color labels
-            top_points_ratio: Ratio of closest points to consider for dominant color
+            top_points_ratio: Ratio of closest points to consider for color analysis
             
         Returns:
-            filtered_points: Points with dominant color
-            filtered_colors: Corresponding colors
-            dominant_color: Name of dominant color
+            reference_color: Name of the dominant LEGO color in closest points, or None
         """
         if len(points) == 0:
-            return np.array([]), np.array([]), None
+            return None
         
-        print(f"Extracting dominant color from {len(points)} points...")
+        print(f"Analyzing color from {len(points)} cluster points...")
         
         # Sort points by Z distance (closest first)
         z_distances = points[:, 2]
@@ -236,52 +187,76 @@ class BinPickingFilter:
         top_indices = sorted_indices[:num_top_points]
         top_colors = colors[top_indices]
         
-        # Classify colors if not provided
-        if color_labels is None:
-            hsv_colors = self.rgb_to_hsv_vectorized(top_colors)
-            top_color_labels = []
-            for hsv_color in hsv_colors:
-                color_class = self.classify_lego_color(hsv_color)
-                if color_class is not None:
-                    top_color_labels.append(color_class)
-        else:
-            top_color_labels = [color_labels[i] for i in top_indices if color_labels[i] != 'unknown']
+        print(f"Extracting reference color from {num_top_points} closest points...")
         
-        if len(top_color_labels) == 0:
+        # Convert to HSV and classify colors
+        hsv_colors = self.rgb_to_hsv_vectorized(top_colors)
+        valid_color_labels = []
+        
+        for hsv_color in hsv_colors:
+            color_class = self.classify_lego_color(hsv_color)
+            if color_class is not None:
+                valid_color_labels.append(color_class)
+        
+        if len(valid_color_labels) == 0:
             print("No valid LEGO colors found in closest points")
-            return points, colors, None
+            return None
         
-        # Find dominant color
-        color_counts = Counter(top_color_labels)
-        dominant_color = color_counts.most_common(1)[0][0]
+        # Find dominant color among closest points
+        color_counts = Counter(valid_color_labels)
+        reference_color = color_counts.most_common(1)[0][0]
         
-        print(f"Dominant color: {dominant_color}")
+        print(f"Reference color: {reference_color}")
         print(f"Color distribution in closest points: {dict(color_counts)}")
         
-        # Filter all points by dominant color
-        if color_labels is None:
-            # Re-classify all colors
-            hsv_all = self.rgb_to_hsv_vectorized(colors)
-            all_color_labels = []
-            for hsv_color in hsv_all:
-                color_class = self.classify_lego_color(hsv_color)
-                all_color_labels.append(color_class)
-        else:
-            all_color_labels = color_labels
+        return reference_color
+    
+    def filter_cluster_by_color(self, points, colors, reference_color):
+        """
+        Filter cluster points to keep only those matching the reference color
         
-        # Keep points with dominant color
-        dominant_mask = np.array([label == dominant_color for label in all_color_labels])
-        filtered_points = points[dominant_mask]
-        filtered_colors = colors[dominant_mask]
+        Args:
+            points: Cluster points (N x 3)
+            colors: Cluster colors (N x 3)
+            reference_color: Target LEGO color name
+            
+        Returns:
+            filtered_points: Points matching reference color
+            filtered_colors: Corresponding colors
+        """
+        if len(points) == 0:
+            return np.array([]), np.array([])
         
-        print(f"Filtered to {len(filtered_points)} points with {dominant_color} color")
+        print(f"Filtering {len(points)} cluster points by color '{reference_color}'...")
         
-        return filtered_points, filtered_colors, dominant_color
+        # Convert all colors to HSV and classify
+        hsv_colors = self.rgb_to_hsv_vectorized(colors)
+        color_labels = []
+        
+        for hsv_color in hsv_colors:
+            color_class = self.classify_lego_color(hsv_color)
+            color_labels.append(color_class)
+        
+        # Create mask for points matching reference color
+        color_mask = np.array([label == reference_color for label in color_labels])
+        
+        # Filter points and colors
+        filtered_points = points[color_mask]
+        filtered_colors = colors[color_mask]
+        
+        print(f"Kept {len(filtered_points)} points with {reference_color} color")
+        
+        return filtered_points, filtered_colors
     
     def apply_bin_picking_filters(self, points, colors, dbscan_eps=0.01, 
                                 dbscan_min_samples=10, top_points_ratio=0.3):
         """
         Apply complete bin picking filtering pipeline (Step 0)
+        
+        CORRECT PIPELINE:
+        1. Find closest cluster from ALL points (no color filtering yet)
+        2. In that closest cluster, identify color of CLOSEST POINTS to camera
+        3. Filter the entire closest cluster to keep only points with that same color
         
         Args:
             points: Input point cloud (N x 3)
@@ -297,22 +272,10 @@ class BinPickingFilter:
         print("STEP 0: CLOSEST BRICK CLUSTER FILTERING")
         print("="*50)
         
-        # Step 0.1: Filter by valid LEGO colors
-        lego_points, lego_colors, color_labels = self.filter_by_lego_colors(points, colors)
-        
-        if len(lego_points) == 0:
-            print("No valid LEGO colors found!")
-            return {
-                'points': np.array([]),
-                'colors': np.array([]),
-                'dominant_color': None,
-                'cluster_info': {},
-                'success': False
-            }
-        
-        # Step 0.2: Find closest cluster
+        # Step 0.1: Find closest cluster from ALL points (no color filtering first)
+        print("Step 0.1: Finding closest cluster from all points...")
         closest_points, closest_colors, cluster_info = self.find_closest_cluster(
-            lego_points, lego_colors, eps=dbscan_eps, min_samples=dbscan_min_samples)
+            points, colors, eps=dbscan_eps, min_samples=dbscan_min_samples)
         
         if len(closest_points) == 0:
             print("No closest cluster found!")
@@ -324,31 +287,46 @@ class BinPickingFilter:
                 'success': False
             }
         
-        # Step 0.3: Extract dominant color region
-        filtered_points, filtered_colors, dominant_color = self.extract_dominant_color_region(
+        # Step 0.2: Extract reference color from CLOSEST POINTS in the cluster
+        print("Step 0.2: Extracting reference color from closest points...")
+        reference_color = self.get_reference_color_from_closest_points(
             closest_points, closest_colors, top_points_ratio=top_points_ratio)
         
-        if len(filtered_points) == 0:
-            print("No points with dominant color found!")
+        if reference_color is None:
+            print("No valid LEGO color found in closest points!")
             return {
                 'points': np.array([]),
                 'colors': np.array([]),
-                'dominant_color': dominant_color,
+                'dominant_color': None,
                 'cluster_info': cluster_info,
                 'success': False
             }
         
-        print(f"Final result: {len(filtered_points)} points with {dominant_color} color")
+        # Step 0.3: Filter cluster by reference color
+        print(f"Step 0.3: Filtering cluster by reference color '{reference_color}'...")
+        filtered_points, filtered_colors = self.filter_cluster_by_color(
+            closest_points, closest_colors, reference_color)
+        
+        if len(filtered_points) == 0:
+            print(f"No points with reference color '{reference_color}' found!")
+            return {
+                'points': np.array([]),
+                'colors': np.array([]),
+                'dominant_color': reference_color,
+                'cluster_info': cluster_info,
+                'success': False
+            }
+        
+        print(f"Final result: {len(filtered_points)} points with {reference_color} color")
         print("="*50)
         
         return {
             'points': filtered_points,
             'colors': filtered_colors,
-            'dominant_color': dominant_color,
+            'dominant_color': reference_color,
             'cluster_info': cluster_info,
             'success': True,
             'original_count': len(points),
-            'lego_color_count': len(lego_points),
             'closest_cluster_count': len(closest_points),
             'final_count': len(filtered_points)
         }
