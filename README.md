@@ -30,7 +30,7 @@ The system follows the pipeline described in the research paper "3D object detec
 
 ### Supporting Files
 
-- **`neighborhoords.py`**: Neighborhood computation for Harris detection
+- **`neighborhoods.py`**: Neighborhood computation for Harris detection
 - **`transformation.py`**: Point cloud transformation utilities
 - **`utils/ply.py`**: PLY file I/O compatibility layer
 

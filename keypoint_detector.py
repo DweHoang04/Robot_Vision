@@ -7,7 +7,7 @@ import itertools
 import numpy as np
 from sklearn.decomposition import PCA
 from math import sqrt
-import neighborhoords
+import neighborhoods
 import transformation
 
 class Harris3DDetector:
@@ -53,7 +53,7 @@ class Harris3DDetector:
         
         Args:
             points: Input point cloud as numpy array (N x 3)
-            neighborhood_method: 'adaptive' or 'k_ring'
+            neighborhood_method: 'k_ring_adaptive' or 'k_ring'
             
         Returns:
             resp: Harris response values for each point
@@ -67,10 +67,10 @@ class Harris3DDetector:
         # Compute neighborhood
         if neighborhood_method == 'adaptive':
             print("Using adaptive k-ring Delaunay neighborhood...")
-            neighborhood = neighborhoords.k_ring_delaunay_adaptive(points, self.delta)
+            neighborhood = neighborhoods.k_ring_delaunay_adaptive(points, self.delta)
         else:
             print("Using k-ring Delaunay neighborhood...")
-            neighborhood = neighborhoords.k_ring_delaunay(points, self.n_neighbours)
+            neighborhood = neighborhoods.k_ring_delaunay(points, self.n_neighbours)
         
         print(f"Computed neighborhoods for {len(neighborhood)} points")
         
@@ -84,7 +84,7 @@ class Harris3DDetector:
                     
                 neighbors_centred, _ = transformation.centering_centroid(neighbors)
                 
-                # Best fitting plane using PCA
+                # Best fitting plane using PCA (Principal Component Analysis)
                 pca = PCA(n_components=3)
                 neighbors_pca = pca.fit_transform(neighbors_centred)
                 eigenvalues, eigenvectors = np.linalg.eigh(pca.components_)
