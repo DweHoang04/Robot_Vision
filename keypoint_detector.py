@@ -82,32 +82,35 @@ class Harris3DDetector:
                 if len(neighbors) < 3:
                     continue
                     
-                neighbors_centred, _ = transformation.centering_centroid(neighbors)
+                # Center the ENTIRE point cloud (following original algorithm)
+                points_centred, _ = transformation.centering_centroid(points)
                 
-                # Best fitting plane using PCA (Principal Component Analysis)
-                pca = PCA(n_components=3)
-                neighbors_pca = pca.fit_transform(neighbors_centred)
-                eigenvalues, eigenvectors = np.linalg.eigh(pca.components_)
+                # Best fitting plane using PCA on ENTIRE point cloud
+                pca = PCA(n_components=3) # Principal Component Analysis
+                points_pca = pca.fit_transform(np.transpose(points_centred))
+                eigenvalues, eigenvectors = np.linalg.eigh(points_pca)
+                idx = np.argmin(eigenvalues, axis=0)
+                best_fit_normal = eigenvectors[idx,:]
                 
-                # Rotate the cloud to align with principal components
-                for i in range(neighbors.shape[0]):
-                    neighbors[i, :] = np.dot(np.transpose(eigenvectors), neighbors[i, :])
+                # Rotate the ENTIRE point cloud to align with principal components
+                points_rotated = points.copy()
+                for i in range(points.shape[0]):
+                    points_rotated[i, :] = np.dot(np.transpose(eigenvectors), points[i, :])
 
-                # Restrict to XY plane and translate
-                neighbors_2D = neighbors[:,:2] - neighbors[0,:2]
+                # Restrict to XY plane and translate (using rotated entire point cloud)
+                points_2D = points_rotated[:,:2] - points_rotated[point_idx,:2]
 
-                # Fit a quadratic surface
-                if len(neighbors_2D) >= 6:  # Need at least 6 points for quadratic fit
-                    m = self.polyfit3d(neighbors_2D[:,0], neighbors_2D[:,1], neighbors[:,2], order=2)
-                    m = m.reshape((3,3))
+                # Fit a quadratic surface using entire transformed point cloud
+                m = self.polyfit3d(points_2D[:,0], points_2D[:,1], points_rotated[:,2], order=2)
+                m = m.reshape((3,3))
 
-                    # Compute the derivative components
-                    fx2 = m[1, 0]*m[1, 0] + 2*m[2, 0]*m[2, 0] + 2*m[1, 1]*m[1, 1]  # A
-                    fy2 = m[1, 0]*m[1, 0] + 2*m[1, 1]*m[1, 1] + 2*m[0, 2]*m[0, 2]  # B
-                    fxfy = m[1, 0]*m[0, 1] + 2*m[2, 0]*m[1, 1] + 2*m[1, 1]*m[0, 2]  # C
+                # Compute the derivative components
+                fx2  = m[1, 0]*m[1, 0] + 2*m[2, 0]*m[2, 0] + 2*m[1, 1]*m[1, 1]  # A
+                fy2  = m[1, 0]*m[1, 0] + 2*m[1, 1]*m[1, 1] + 2*m[0, 2]*m[0, 2]  # B
+                fxfy = m[1, 0]*m[0, 1] + 2*m[2, 0]*m[1, 1] + 2*m[1, 1]*m[0, 2]  # C
 
-                    # Compute Harris corner response
-                    resp[point_idx] = fx2*fy2 - fxfy*fxfy - self.k*(fx2 + fy2)*(fx2 + fy2)
+                # Compute Harris corner response
+                resp[point_idx] = fx2*fy2 - fxfy*fxfy - self.k*(fx2 + fy2)*(fx2 + fy2)
                     
             except Exception as e:
                 # If any error occurs in processing this point, skip it
