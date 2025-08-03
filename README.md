@@ -47,7 +47,7 @@ pip install pykinect2  # For Kinect support
 
 - Microsoft Kinect v2 camera
 - Windows environment (for Kinect SDK)
-- LEGO Duplo 2x3 brick STL file (`LegoBrick_4_2.stl`)
+- LEGO Duplo 2x4 brick STL file (`LegoBrick_4_2.stl`)
 
 ## Usage
 
@@ -237,10 +237,16 @@ The system generates several output files:
 3. **Lower spin image resolution**: Smaller images for faster correlation
 4. **Enable early termination**: Stop RANSAC when good solution found
 
-## Research Paper Implementation
+## References
 
-This implementation follows the methodology described in:
-"3D object detection and pose estimation from depth image for robotic bin picking"
+This implementation is based on the methodology described in:
+
+**"3D object detection and pose estimation from depth image for robotic bin picking"**  
+*2014 IEEE International Conference on Automation Science and Engineering (CASE)*  
+Date of Conference: 18-22 August 2014  
+DOI: 10.1109/CoASE.2014.6899489  
+Publisher: IEEE  
+Conference Location: New Taipei, Taiwan  
 
 ### Key Equations Implemented
 
